@@ -24,13 +24,26 @@ if (!ext) {
 
 // ============ 2. 配置项 ============
 seal.ext.registerStringConfig(ext, 'controllerUrl', 'http://127.0.0.1:8000', '赛时控制器地址（协议 Base URL）');
-seal.ext.registerStringConfig(ext, 'matchToken', '', '比赛令牌 X-Match-Token（/api/init 返回 tokens.match）');
-seal.ext.registerStringConfig(ext, 'defenderToken', '', '守护者阵营令牌 X-Team-Token（tokens.defender）');
-seal.ext.registerStringConfig(ext, 'attackerToken', '', '掠夺者阵营令牌 X-Team-Token（tokens.attacker）');
 seal.ext.registerStringConfig(ext, 'renderUrl', 'http://127.0.0.1:37632', 'aiplugin4-backends md-html-render 地址（结果图片渲染）');
 seal.ext.registerStringConfig(ext, 'screenshotUrl', '', '网页截图后端地址（aiplugin4-backends web-read，如 http://127.0.0.1:46799）；留空则用 renderUrl 渲染结果卡片');
 seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访问令牌（aiplugin4-backends 配置了 token 时填写，请求头 X-Token）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
+
+// 清理旧版配置项（秘钥已改为开局时由 .ts start 自动获取并存储，不再手填）
+try {
+  seal.ext.unregisterConfig(ext, 'matchToken', 'defenderToken', 'attackerToken');
+} catch (e) {
+  // 接口不支持或已清理时忽略
+}
+
+// 秘钥存储 key（只写不展示）
+const K_MATCH = 'ts_match_token';
+const K_DEF = 'ts_defender_token';
+const K_ATK = 'ts_attacker_token';
+
+function getStoredToken(key) {
+  return ext.storageGet(key) || '';
+}
 
 function getCfg(key) {
   return seal.ext.getStringConfig(ext, key) || '';
@@ -120,7 +133,7 @@ function bindPlayer(userId, team, name) {
   const key = String(userId);
   const prev = players[key] || {};
   players[key] = {
-    id: prev.id || 'qq:' + key,
+    id: prev.id || key,
     name: name || prev.name || key,
     team: team
   };
@@ -135,6 +148,47 @@ function unbindPlayer(userId) {
   delete players[key];
   savePlayers(players);
   return existed;
+}
+
+// 从 "QQ:3837233349" 这类 userId 里取出纯数字 QQ 号
+function qqNumberFromUserId(userId) {
+  const m = String(userId || '').match(/^QQ:(\d+)$/);
+  return m ? m[1] : '';
+}
+
+// 通过 ob11 接口获取真实 QQ 昵称（群聊 get_group_member_info，私聊 get_stranger_info）
+async function fetchNickname(ctx, msg) {
+  const net = getNet();
+  const uid = qqNumberFromUserId(msg.sender.userId);
+  if (!uid || !net || typeof net.callApi !== 'function') {
+    return String(msg.sender.nickname || '').trim() || ctx.player.name || String(msg.sender.userId);
+  }
+  const epId = ctx && ctx.endPoint ? ctx.endPoint.userId : '';
+  const isGroup = msg.messageType === 'group' && msg.groupId;
+  try {
+    let data = null;
+    if (isGroup) {
+      const gid = String(msg.groupId).replace(/^QQ-Group:/, '').trim();
+      const r = await withTimeout(
+        net.callApi(epId, 'get_group_member_info', { group_id: Number(gid), user_id: Number(uid) }),
+        10000
+      );
+      data = r && r.data ? r.data : r;
+    } else {
+      const r = await withTimeout(
+        net.callApi(epId, 'get_stranger_info', { user_id: Number(uid) }),
+        10000
+      );
+      data = r && r.data ? r.data : r;
+    }
+    if (data && data.nickname) {
+      const nick = String(data.nickname).trim();
+      if (nick) return nick;
+    }
+  } catch (e) {
+    console.log('[' + ext.name + '] 获取 QQ 昵称失败：' + (e && e.message ? e.message : e));
+  }
+  return String(msg.sender.nickname || '').trim() || ctx.player.name || uid;
 }
 
 // ============ 5. 图片获取（引用消息 → ob11 → 图片 URL） ============
@@ -199,8 +253,8 @@ function teamName(team) {
 
 async function postUpload(player, recognized) {
   const base = getCfg('controllerUrl').replace(/\/+$/, '');
-  const matchToken = getCfg('matchToken');
-  const teamToken = player.team === 'attacker' ? getCfg('attackerToken') : getCfg('defenderToken');
+  const matchToken = getStoredToken(K_MATCH);
+  const teamToken = player.team === 'attacker' ? getStoredToken(K_ATK) : getStoredToken(K_DEF);
 
   const result = {};
   const score = toInt(recognized.score);
@@ -246,6 +300,45 @@ async function postUpload(player, recognized) {
   return { status: resp.status, body: body, payload: payload };
 }
 
+// 开局：调用 /api/init，把返回的三把秘钥存入插件存储（不展示）
+async function startMatchAsync(ctx, msg) {
+  const base = getCfg('controllerUrl').replace(/\/+$/, '');
+  if (!base) {
+    seal.replyToSender(ctx, msg, '未配置 controllerUrl（插件设置）');
+    return;
+  }
+  seal.replyToSender(ctx, msg, '正在开局，请稍候…');
+  try {
+    const resp = await withTimeout(fetch(base + '/api/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }), 30000);
+    let body = null;
+    try {
+      body = await resp.json();
+    } catch (e) {
+      body = null;
+    }
+    if (resp.status >= 400 || !body || !body.ok) {
+      const message = body && body.message ? body.message : 'HTTP ' + resp.status;
+      seal.replyToSender(ctx, msg, '开局失败：' + message + '（若提示请先导入歌曲库，需由后端运行人先 POST /api/songs）');
+      return;
+    }
+    const t = body.tokens || {};
+    if (t.match && t.defender && t.attacker) {
+      ext.storageSet(K_MATCH, String(t.match));
+      ext.storageSet(K_DEF, String(t.defender));
+      ext.storageSet(K_ATK, String(t.attacker));
+      seal.replyToSender(ctx, msg, '比赛已开始，秘钥已记录（不对外展示）。现在可以引用截图发送「上传成绩」了。');
+    } else {
+      seal.replyToSender(ctx, msg, '开局成功但响应缺少 tokens，请确认控制器已包含成绩上传协议（/api/v1）');
+    }
+  } catch (e) {
+    seal.replyToSender(ctx, msg, '开局失败（网络/接口）：' + (e && e.message ? e.message : e));
+  }
+}
+
 function outcomeText(body) {
   if (!body || !body.ok) return '';
   const map = {
@@ -256,6 +349,13 @@ function outcomeText(body) {
     duplicate: '重复上报'
   };
   return map[body.outcome] || body.outcome || '';
+}
+
+async function bindAsync(ctx, msg, team) {
+  const userId = String(msg.sender.userId);
+  const name = await fetchNickname(ctx, msg);
+  const p = bindPlayer(userId, team, name);
+  seal.replyToSender(ctx, msg, '已绑定：' + p.name + '（' + teamName(team) + '）');
 }
 
 // ============ 7. 结果图片（aiplugin4-backends md-html-render） ============
@@ -381,13 +481,13 @@ async function handleUpload(ctx, msg, replyId) {
     seal.replyToSender(ctx, msg, '未识别到有效曲名' + (songName ? '：' + songName : ''));
     return;
   }
-  if (!getCfg('matchToken')) {
-    seal.replyToSender(ctx, msg, '比赛令牌未配置（插件设置 → matchToken），请先填入 /api/init 返回的 tokens.match');
+  if (!getStoredToken(K_MATCH)) {
+    seal.replyToSender(ctx, msg, '比赛尚未开局，请先发送 .ts start 开局并记录秘钥');
     return;
   }
-  const teamToken = player.team === 'attacker' ? getCfg('attackerToken') : getCfg('defenderToken');
+  const teamToken = player.team === 'attacker' ? getStoredToken(K_ATK) : getStoredToken(K_DEF);
   if (!teamToken) {
-    seal.replyToSender(ctx, msg, '阵营令牌未配置（插件设置 → ' + (player.team === 'attacker' ? 'attackerToken' : 'defenderToken') + '）');
+    seal.replyToSender(ctx, msg, '阵营秘钥缺失，请重新发送 .ts start 开局');
     return;
   }
 
@@ -432,7 +532,8 @@ cmd.name = 'ts';
 cmd.help = [
   '.ts help                    查看帮助',
   '.ts status                  查看配置与依赖状态',
-  '.ts bind <attacker|defender> [昵称]   绑定本人阵营（记录选手身份）',
+  '.ts start                   开局并自动记录秘钥（秘钥不展示）',
+  '.ts bind <attacker|defender>   绑定本人阵营（昵称自动读取 QQ 昵称）',
   '.ts unbind                  解除本人绑定',
   '.ts me                      查看本人绑定',
   '.ts list                    查看已绑定选手',
@@ -456,16 +557,20 @@ cmd.solve = function (ctx, msg, cmdArgs) {
 
   if (sub === 'status') {
     const lines = [
-      '控制器：' + getCfg('controllerUrl'),
-      '比赛令牌：' + (getCfg('matchToken') ? '已配置' : '未配置'),
-      '守护者令牌：' + (getCfg('defenderToken') ? '已配置' : '未配置'),
-      '掠夺者令牌：' + (getCfg('attackerToken') ? '已配置' : '未配置'),
-      '渲染后端：' + getCfg('renderUrl'),
+      '比赛状态：' + (getStoredToken(K_MATCH) ? '已开局（秘钥已记录）' : '未开局（发送 .ts start 开局）'),
+      '控制器：' + (getCfg('controllerUrl') ? '已配置' : '未配置'),
+      '渲染后端：' + (getCfg('renderUrl') ? '已配置' : '未配置'),
+      '截图后端：' + (getCfg('screenshotUrl') ? '已配置' : '未配置'),
       '识图接口：' + (globalThis.imageRecognizerAPI ? '可用 v' + (globalThis.imageRecognizerAPI.version || '?') : '缺失（需安装 image-recognizer）'),
       'ob11 依赖：' + (getNet() ? '可用' : '缺失'),
       '已绑定选手：' + Object.keys(loadPlayers()).length + ' 人'
     ];
     seal.replyToSender(ctx, msg, lines.join('\n'));
+    return ret;
+  }
+
+  if (sub === 'start') {
+    startMatchAsync(ctx, msg);
     return ret;
   }
 
@@ -475,12 +580,10 @@ cmd.solve = function (ctx, msg, cmdArgs) {
     if (teamArg === 'attacker' || teamArg === '掠夺者' || teamArg === '红') team = 'attacker';
     if (teamArg === 'defender' || teamArg === '守护者' || teamArg === '蓝') team = 'defender';
     if (!team) {
-      seal.replyToSender(ctx, msg, '用法：.ts bind <attacker|defender> [昵称]（attacker=掠夺者/红方，defender=守护者/蓝方）');
+      seal.replyToSender(ctx, msg, '用法：.ts bind <attacker|defender>（attacker=掠夺者/红方，defender=守护者/蓝方）');
       return ret;
     }
-    const name = String(cmdArgs.getArgN(3) || '').trim() || ctx.player.name || userId;
-    const p = bindPlayer(userId, team, name);
-    seal.replyToSender(ctx, msg, '已绑定：' + p.name + '（' + teamName(team) + '，ID=' + p.id + '）');
+    bindAsync(ctx, msg, team);
     return ret;
   }
 
@@ -492,7 +595,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
 
   if (sub === 'me') {
     const p = loadPlayers()[userId];
-    seal.replyToSender(ctx, msg, p ? '选手：' + p.name + '（' + teamName(p.team) + '，ID=' + p.id + '）' : '尚未绑定，请先 .ts bind <attacker|defender> [昵称]');
+    seal.replyToSender(ctx, msg, p ? '选手：' + p.name + '（' + teamName(p.team) + '）' : '尚未绑定，请先 .ts bind <attacker|defender>');
     return ret;
   }
 
@@ -505,7 +608,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
     }
     const lines = keys.map(function (k) {
       const p = players[k];
-      return 'QQ ' + k + '：' + p.name + '（' + teamName(p.team) + '）';
+      return p.name + '（' + teamName(p.team) + '）';
     });
     seal.replyToSender(ctx, msg, '已绑定选手（' + keys.length + '）：\n' + lines.join('\n'));
     return ret;
