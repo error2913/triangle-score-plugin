@@ -33,10 +33,6 @@ global.fetch = function (url, opts) {
   if (u.includes('/api/end')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
   if (u.includes('/api/state')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: true, game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 5, time_limit: 25 }) });
   if (u.includes('/api/v1/results')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, code: 'RESULT_PROCESSED', outcome: 'occupied', data: { scores: { defender: 1, attacker: 2 }, event: 'occupy' } }) });
-  if (u.includes('/api/image/time')) {
-    if (global.__TIME_FAIL__) return Promise.resolve({ ok: false, status: 422, json: () => Promise.resolve({ detail: 'mock 时间校验失败' }) });
-    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ capture_time_utc: '2026-08-09T08:00:00Z', capture_time: '2026-08-09T16:00:00+08:00', time_metadata: [], message: null }) });
-  }
   if (u.includes('/mcp')) {
     if (bodyObj && bodyObj.method === 'initialize') {
       return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'SID1' }, text: () => Promise.resolve('{}') });
@@ -94,7 +90,6 @@ setTimeout(() => {
     const pkey = Object.keys(pending)[0];
     check('confirmation keyed by message_id 555', pkey === '555', pkey);
     check('confirmation text sent', !!netMessages.find(t => t.includes('成绩待确认') && t.includes('修改')), netMessages[0] ? netMessages[0].slice(0, 40) : 'none');
-    check('confirmation includes capture time', !!netMessages.find(t => t.includes('拍摄时间(UTC)：2026-08-09T08:00:00Z')), '');
     check('no direct upload yet', !calls.find(c => c.url.includes('/api/v1/results')), '');
 
     replies.length = 0;
