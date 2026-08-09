@@ -26,7 +26,7 @@ if (!ext) {
 seal.ext.registerStringConfig(ext, 'controllerUrl', 'http://127.0.0.1:8000', '赛时控制器地址（协议 Base URL）');
 seal.ext.registerStringConfig(ext, 'screenshotUrl', 'http://127.0.0.1:46799', '网页截图后端地址（aiplugin4-backends web-read）');
 seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访问令牌（aiplugin4-backends 配置了 token 时填写，请求头 X-Token）');
-seal.ext.registerStringConfig(ext, 'timeApiUrl', 'http://127.0.0.1:8000', '图片时间元数据校验 API 地址（POST /api/image/time，返回拍摄时间）');
+seal.ext.registerStringConfig(ext, 'timeApiUrl', 'http://127.0.0.1:20637', '图片时间元数据校验 API 地址（POST /api/image/time，返回拍摄时间）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
 
 // 清理旧版配置项（秘钥已改为开局时由 .ts start 自动获取并存储；renderUrl 已移除，改走网页截图）
