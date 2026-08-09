@@ -29,6 +29,7 @@ seal.ext.registerStringConfig(ext, 'defenderToken', '', '守护者阵营令牌 X
 seal.ext.registerStringConfig(ext, 'attackerToken', '', '掠夺者阵营令牌 X-Team-Token（tokens.attacker）');
 seal.ext.registerStringConfig(ext, 'renderUrl', 'http://127.0.0.1:37632', 'aiplugin4-backends md-html-render 地址（结果图片渲染）');
 seal.ext.registerStringConfig(ext, 'screenshotUrl', '', '网页截图后端地址（aiplugin4-backends web-read，如 http://127.0.0.1:46799）；留空则用 renderUrl 渲染结果卡片');
+seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访问令牌（aiplugin4-backends 配置了 token 时填写，请求头 X-Token）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
 
 function getCfg(key) {
@@ -304,9 +305,12 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
   const ctrlBase = getCfg('controllerUrl').replace(/\/+$/, '');
   if (!base) return false;
   try {
+    const headers = { 'Content-Type': 'application/json' };
+    const token = getCfg('screenshotToken');
+    if (token) headers['X-Token'] = token;
     const resp = await withTimeout(fetch(base + '/screenshot', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headers,
       body: JSON.stringify({
         url: ctrlBase,
         width: 1680,
