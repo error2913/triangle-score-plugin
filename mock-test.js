@@ -33,10 +33,6 @@ global.fetch = function (url, opts) {
   if (u.includes('/api/end')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
   if (u.includes('/api/state')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: true, game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 5, time_limit: 25 }) });
   if (u.includes('/api/v1/results')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, code: 'RESULT_PROCESSED', outcome: 'occupied', data: { scores: { defender: 1, attacker: 2 }, event: 'occupy' } }) });
-  if (u.includes('/screenshot')) {
-    if (global.__REST_FAIL__) return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}), text: () => Promise.resolve('<html>404</html>') });
-    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ status: 'success', base64: 'QUJD' }) });
-  }
   if (u.includes('/mcp')) {
     if (bodyObj && bodyObj.method === 'initialize') {
       return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'SID1' }, text: () => Promise.resolve('{}') });
@@ -135,16 +131,16 @@ setTimeout(() => {
           setTimeout(() => {
             check('status shows ended + winner', replies[0].startsWith('比赛状态：已结束（守护者获胜）'), replies[0].split('\n')[0]);
 
-            // 9. REST 失败 -> MCP 兜底（.ts shot）
-            global.__REST_FAIL__ = true;
+            // 9. MCP 截图（.ts shot，不再调用 REST）
             replies.length = 0; calls.length = 0;
             ext.cmdMap['ts'].solve(ctx(60), msg('.ts shot'), args('shot'));
             setTimeout(() => {
               const mcpCall = calls.find(c => c.url.includes('/mcp') && c.opts.body && JSON.parse(c.opts.body).method === 'tools/call');
-              check('MCP fallback called when REST fails', !!mcpCall, '');
+              check('MCP screenshot_url called', !!mcpCall, '');
+              check('no REST /screenshot call', !calls.find(c => c.url.includes('/screenshot')), '');
               check('MCP screenshot image reply', !!replies.find(r => r.startsWith('[CQ:image,file=base64://')), '');
 
-              // 10. REST + MCP 都失败 -> 纯文本兜底
+              // 10. MCP 失败 -> 纯文本兜底
               global.__MCP_FAIL__ = true;
               replies.length = 0; calls.length = 0;
               ext.cmdMap['ts'].solve(ctx(60), msg('.ts shot'), args('shot'));

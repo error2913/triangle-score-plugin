@@ -559,9 +559,8 @@ async function bindAsync(ctx, msg, team) {
   seal.replyToSender(ctx, msg, '已绑定：' + p.name + '（' + teamName(team) + '）');
 }
 
-// ============ 7. 结果返回（aiplugin4-backends web-read /screenshot） ============
-// 对控制器网页本身截图；优先 REST /screenshot，失败自动切 MCP /mcp（screenshot_url 工具）；
-// 都失败时回退纯文本
+// ============ 7. 结果返回（aiplugin4-backends web-read MCP） ============
+// 对控制器网页本身截图；通过 MCP /mcp 的 screenshot_url 工具调用，失败时回退纯文本
 function parseMcpResult(text) {
   // MCP Streamable HTTP 响应可能是纯 JSON 或 SSE（event: message\ndata: {...}）
   let obj = null;
@@ -647,45 +646,12 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
   const base = getCfg('screenshotUrl').replace(/\/+$/, '');
   const ctrlBase = getCfg('controllerUrl').replace(/\/+$/, '');
   if (!base) return false;
-  const headers = { 'Content-Type': 'application/json' };
   const token = getCfg('screenshotToken');
-  if (token) headers['X-Token'] = token;
   let b64 = null;
   try {
-    const resp = await withTimeout(fetch(base + '/screenshot', {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify({
-        url: ctrlBase,
-        width: 1680,
-        height: 1000,
-        delay: 4500,
-        fullPage: false
-      })
-    }), 70000);
-    let data = null;
-    let textPreview = '';
-    try {
-      data = await resp.json();
-    } catch (e) {
-      try {
-        textPreview = String(await resp.text() || '').slice(0, 100);
-      } catch (e2) {
-        textPreview = '';
-      }
-    }
-    if (resp.ok && data && data.base64) {
-      b64 = data.base64;
-    }
+    b64 = await mcpScreenshot(base, ctrlBase, token);
   } catch (e) {
-    console.log('[' + ext.name + '] REST 截图失败，尝试 MCP：' + (e && e.message ? e.message : e));
-  }
-  if (!b64) {
-    try {
-      b64 = await mcpScreenshot(base, ctrlBase, token);
-    } catch (e) {
-      console.log('[' + ext.name + '] MCP 截图失败：' + (e && e.message ? e.message : e));
-    }
+    console.log('[' + ext.name + '] MCP 截图失败：' + (e && e.message ? e.message : e));
   }
   if (b64) {
     seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + b64 + ']');
