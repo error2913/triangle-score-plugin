@@ -9,9 +9,8 @@
   得到曲名 / 难度 / 得分 / TP 等结构化数据；
 - 按成绩上传协议 `POST /api/v1/results` 上传到赛时控制器，自动完成歌曲→格子映射、
   普通格占领与 L1 挑战；
-- 上传成功后优先**截取控制器网页本身**（aiplugin4-backends web-read `/screenshot`，
-  Puppeteer 无头截图）返回棋盘画面；未配置截图后端时回退到 `md-html-render`
-  渲染的结果图片卡片；
+- 上传成功后**截取控制器网页本身**（aiplugin4-backends web-read `/screenshot`，
+  Puppeteer 无头截图）返回棋盘画面；截图失败时回退纯文本结果；
 - 记录选手身份：`QQ → 阵营 + 昵称` 持久化绑定，上传时自动带上选手 ID。
 
 ## 依赖（插件加载依赖链）
@@ -20,8 +19,7 @@
 - image-recognizer 自身依赖 `ob11网络连接依赖`（拉取被引用消息图片）与
   `AI骰娘4`（图片模型识别，需开启「图片模型」并配置如 `glm-4v-plus`）；
 - 赛时控制器服务（`competition_web/demo`，需已实现 `/api/v1/results` 协议）；
-- aiplugin4-backends 的 `md-html-render` 后端（默认 `http://127.0.0.1:37632`）。
-- 可选：aiplugin4-backends 的 `web-read` 后端（默认 `http://127.0.0.1:46799`），
+- aiplugin4-backends 的 `web-read` 后端（默认 `http://127.0.0.1:46799`），
   用于对控制器网页截图（需该后端含 `/screenshot` 接口，见 aiplugin4-backends web-read）。
 
 ## 安装
@@ -30,9 +28,9 @@
 2. 确保 image-recognizer 已加载（`image-recognizer.js` 或 `image-recognizer-cy2.js`，二选一）；
 3. 启动赛时控制器，导入歌曲库并 `POST /api/init` 开局，从返回的 `tokens` 中取得：
    `match`（比赛令牌）、`defender` / `attacker`（阵营令牌）；
-4. 在插件设置中填入：`controllerUrl`、`matchToken`、`defenderToken`、`attackerToken`、
-   `renderUrl`（aiplugin4-backends md-html-render 地址）、`screenshotUrl`
-   （可选，aiplugin4-backends web-read 地址，填了优先返回控制器网页截图）。
+4. 在插件设置中填入：`controllerUrl`（机器人能访问到的控制器地址）；
+   `screenshotUrl` 默认 `http://127.0.0.1:46799`（web-read 后端），如需 token 再填 `screenshotToken`。
+   秘钥不需要配置：群内发送 `.ts start` 开局时自动获取并存储。
 
 ## 使用
 

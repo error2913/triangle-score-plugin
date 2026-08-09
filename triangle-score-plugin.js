@@ -2,7 +2,7 @@
 // @name         triangle-score-plugin
 // @author       错误
 // @version      1.0.0
-// @description  对接「三角占领 · 赛时控制器」成绩上传协议：引用结算截图 → image-recognizer 识别 → 上传成绩 → 渲染结果图片返回
+// @description  对接「三角占领 · 赛时控制器」成绩上传协议：引用结算截图 → image-recognizer 识别 → 上传成绩 → 截取控制器网页返回
 // @timestamp    2026-08-09
 // @license      MIT
 // @homepageURL  https://github.com/error2913/triangle-score-plugin
@@ -24,14 +24,13 @@ if (!ext) {
 
 // ============ 2. 配置项 ============
 seal.ext.registerStringConfig(ext, 'controllerUrl', 'http://127.0.0.1:8000', '赛时控制器地址（协议 Base URL）');
-seal.ext.registerStringConfig(ext, 'renderUrl', 'http://127.0.0.1:37632', 'aiplugin4-backends md-html-render 地址（结果图片渲染）');
-seal.ext.registerStringConfig(ext, 'screenshotUrl', '', '网页截图后端地址（aiplugin4-backends web-read，如 http://127.0.0.1:46799）；留空则用 renderUrl 渲染结果卡片');
+seal.ext.registerStringConfig(ext, 'screenshotUrl', 'http://127.0.0.1:46799', '网页截图后端地址（aiplugin4-backends web-read）');
 seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访问令牌（aiplugin4-backends 配置了 token 时填写，请求头 X-Token）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
 
-// 清理旧版配置项（秘钥已改为开局时由 .ts start 自动获取并存储，不再手填）
+// 清理旧版配置项（秘钥已改为开局时由 .ts start 自动获取并存储；renderUrl 已移除，改走网页截图）
 try {
-  seal.ext.unregisterConfig(ext, 'matchToken', 'defenderToken', 'attackerToken');
+  seal.ext.unregisterConfig(ext, 'matchToken', 'defenderToken', 'attackerToken', 'renderUrl');
 } catch (e) {
   // 接口不支持或已清理时忽略
 }
@@ -103,14 +102,6 @@ function toInt(v) {
   const n = toNum(v);
   if (n === null) return null;
   return Math.floor(n);
-}
-
-function escHtml(s) {
-  return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }
 
 // ============ 4. 选手身份（持久化：ext.storage 存 JSON） ============
@@ -358,48 +349,8 @@ async function bindAsync(ctx, msg, team) {
   seal.replyToSender(ctx, msg, '已绑定：' + p.name + '（' + teamName(team) + '）');
 }
 
-// ============ 7. 结果图片（aiplugin4-backends md-html-render） ============
-function buildResultCard(player, payload, body, outcome) {
-  const d = body && body.data ? body.data : {};
-  const scores = d.scores || {};
-  const p = payload.player || {};
-  const song = payload.song || {};
-  const r = payload.result || {};
-  const lines = [
-    '<div style="background:#0f1115;color:#eaeaea;font-family:sans-serif;padding:24px 28px;border-radius:12px;width:820px">',
-    '<div style="font-size:24px;font-weight:bold;color:#f0c24b;margin-bottom:14px">三角占领 · 成绩上报</div>',
-    '<div style="font-size:15px;margin-bottom:6px">选手：' + escHtml(p.name || p.id) + '（' + escHtml(teamName(player.team)) + '）</div>',
-    '<div style="font-size:15px;margin-bottom:6px">歌曲：' + escHtml(song.name) + (song.level ? '　难度：' + escHtml(song.level) : '') + '</div>',
-    '<div style="font-size:15px;margin-bottom:12px">得分：' + escHtml(r.score != null ? r.score : '-') + '　TP：' + escHtml(r.tp != null ? r.tp : '-') + '</div>',
-    '<div style="font-size:16px;font-weight:bold;color:' + (body && body.ok ? '#4ade80' : '#f87171') + ';margin-bottom:12px">结果：' + escHtml(outcome || (body && body.message) || '未知') + '</div>',
-    '<div style="font-size:15px;margin-bottom:4px">当前比分：守护者 ' + escHtml(scores.defender != null ? scores.defender : '-') + ' : ' + escHtml(scores.attacker != null ? scores.attacker : '-') + ' 掠夺者</div>',
-    d.event ? '<div style="font-size:12px;color:#8a8f98;margin-top:10px">' + escHtml(d.event) + '</div>' : '',
-    '</div>'
-  ];
-  return lines.join('');
-}
-
-async function sendResultImage(ctx, msg, html, fallbackText) {
-  const renderBase = getCfg('renderUrl').replace(/\/+$/, '');
-  try {
-    const resp = await withTimeout(fetch(renderBase + '/render/html', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ html: html, width: 900, quality: 90 })
-    }), 60000);
-    const data = await resp.json();
-    if (resp.ok && data && data.base64) {
-      seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + data.base64 + ']');
-      return true;
-    }
-  } catch (e) {
-    console.log('[' + ext.name + '] 结果图片渲染失败：' + (e && e.message ? e.message : e));
-  }
-  seal.replyToSender(ctx, msg, fallbackText);
-  return false;
-}
-
-// 对控制器网页本身截图（aiplugin4-backends web-read /screenshot）
+// ============ 7. 结果返回（aiplugin4-backends web-read /screenshot） ============
+// 对控制器网页本身截图；截图失败时回退纯文本
 async function takeBoardScreenshot(ctx, msg, fallbackText) {
   const base = getCfg('screenshotUrl').replace(/\/+$/, '');
   const ctrlBase = getCfg('controllerUrl').replace(/\/+$/, '');
@@ -517,13 +468,9 @@ async function handleUpload(ctx, msg, replyId) {
     body.data && body.data.event ? body.data.event : ''
   ].filter(function (x) { return x; }).join('\n');
 
-  const html = buildResultCard(player, res.payload, body, outcome);
-  // 先发一行结果文字，再优先返回控制器网页截图；截图后端不可用时回退渲染卡片
+  // 先发一行结果文字，再截取控制器网页返回；截图失败时回退纯文本
   seal.replyToSender(ctx, msg, '成绩上报完成：' + outcome);
-  const shotOk = await takeBoardScreenshot(ctx, msg, '');
-  if (!shotOk) {
-    await sendResultImage(ctx, msg, html, fallbackText);
-  }
+  await takeBoardScreenshot(ctx, msg, fallbackText);
 }
 
 // ============ 9. 指令 .ts ============
@@ -559,7 +506,6 @@ cmd.solve = function (ctx, msg, cmdArgs) {
     const lines = [
       '比赛状态：' + (getStoredToken(K_MATCH) ? '已开局（秘钥已记录）' : '未开局（发送 .ts start 开局）'),
       '控制器：' + (getCfg('controllerUrl') ? '已配置' : '未配置'),
-      '渲染后端：' + (getCfg('renderUrl') ? '已配置' : '未配置'),
       '截图后端：' + (getCfg('screenshotUrl') ? '已配置' : '未配置'),
       '识图接口：' + (globalThis.imageRecognizerAPI ? '可用 v' + (globalThis.imageRecognizerAPI.version || '?') : '缺失（需安装 image-recognizer）'),
       'ob11 依赖：' + (getNet() ? '可用' : '缺失'),
