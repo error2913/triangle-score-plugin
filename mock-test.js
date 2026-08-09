@@ -28,11 +28,30 @@ global.seal = {
 global.fetch = function (url, opts) {
   calls.push({ url: String(url), opts: opts || {} });
   const u = String(url);
+  const bodyObj = opts && opts.body ? JSON.parse(opts.body) : null;
   if (u.includes('/api/init')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, tokens: { match: 'M', defender: 'D', attacker: 'A' }, state: {} }) });
   if (u.includes('/api/end')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
   if (u.includes('/api/state')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: true, game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 5, time_limit: 25 }) });
   if (u.includes('/api/v1/results')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, code: 'RESULT_PROCESSED', outcome: 'occupied', data: { scores: { defender: 1, attacker: 2 }, event: 'occupy' } }) });
-  if (u.includes('/screenshot')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ status: 'success', base64: 'QUJD' }) });
+  if (u.includes('/screenshot')) {
+    if (global.__REST_FAIL__) return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}), text: () => Promise.resolve('<html>404</html>') });
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ status: 'success', base64: 'QUJD' }) });
+  }
+  if (u.includes('/mcp')) {
+    if (bodyObj && bodyObj.method === 'initialize') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => 'SID1' }, text: () => Promise.resolve('{}') });
+    }
+    if (bodyObj && bodyObj.method === 'notifications/initialized') {
+      return Promise.resolve({ ok: true, status: 202, headers: { get: () => null }, text: () => Promise.resolve('') });
+    }
+    const shotB64 = global.__MCP_FAIL__ ? '网页截图失败: mock error' : 'QUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJDQUJD';
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: () => Promise.resolve('event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"' + shotB64 + '"}]}}\n\n')
+    });
+  }
   return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
 };
 globalThis.imageRecognizerAPI = { version: '1.0.0', recognize: () => Promise.resolve({ ok: true, data: { song: '99 Glooms', difficulty: 'CHAOS', difficultyLevel: '14', score: 900000, tp: 90, miss: 0, bad: 0, good: 3, rating: 'S' } }) };
@@ -115,9 +134,27 @@ setTimeout(() => {
           ext.cmdMap['ts'].solve(ctx(60), msg('.ts status'), args('status'));
           setTimeout(() => {
             check('status shows ended + winner', replies[0].startsWith('比赛状态：已结束（守护者获胜）'), replies[0].split('\n')[0]);
-            const passed = results.filter(Boolean).length;
-            console.log('\n' + passed + '/' + results.length + ' passed');
-            process.exit(passed === results.length ? 0 : 1);
+
+            // 9. REST 失败 -> MCP 兜底（.ts shot）
+            global.__REST_FAIL__ = true;
+            replies.length = 0; calls.length = 0;
+            ext.cmdMap['ts'].solve(ctx(60), msg('.ts shot'), args('shot'));
+            setTimeout(() => {
+              const mcpCall = calls.find(c => c.url.includes('/mcp') && c.opts.body && JSON.parse(c.opts.body).method === 'tools/call');
+              check('MCP fallback called when REST fails', !!mcpCall, '');
+              check('MCP screenshot image reply', !!replies.find(r => r.startsWith('[CQ:image,file=base64://')), '');
+
+              // 10. REST + MCP 都失败 -> 纯文本兜底
+              global.__MCP_FAIL__ = true;
+              replies.length = 0; calls.length = 0;
+              ext.cmdMap['ts'].solve(ctx(60), msg('.ts shot'), args('shot'));
+              setTimeout(() => {
+                check('both fail -> fallback text', !!replies.find(r => r.includes('网页截图失败')), replies.join(' | '));
+                const passed = results.filter(Boolean).length;
+                console.log('\n' + passed + '/' + results.length + ' passed');
+                process.exit(passed === results.length ? 0 : 1);
+              }, 80);
+            }, 80);
           }, 80);
         }, 80);
       }, 80);

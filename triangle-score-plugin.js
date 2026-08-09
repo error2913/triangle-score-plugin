@@ -560,15 +560,98 @@ async function bindAsync(ctx, msg, team) {
 }
 
 // ============ 7. 结果返回（aiplugin4-backends web-read /screenshot） ============
-// 对控制器网页本身截图；截图失败时回退纯文本
+// 对控制器网页本身截图；优先 REST /screenshot，失败自动切 MCP /mcp（screenshot_url 工具）；
+// 都失败时回退纯文本
+function parseMcpResult(text) {
+  // MCP Streamable HTTP 响应可能是纯 JSON 或 SSE（event: message\ndata: {...}）
+  let obj = null;
+  const t = String(text || '').trim();
+  if (t.startsWith('{')) {
+    try {
+      obj = JSON.parse(t);
+    } catch (e) {
+      obj = null;
+    }
+  } else {
+    const lines = t.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf('data:') === 0) {
+        try {
+          const parsed = JSON.parse(lines[i].slice(5).trim());
+          if (parsed && parsed.result) obj = parsed;
+        } catch (e) {
+          // 忽略非 JSON 行
+        }
+      }
+    }
+  }
+  if (!obj || !obj.result) return null;
+  const res = obj.result;
+  if (res && res.content && Array.isArray(res.content)) {
+    return res.content.map(function (c) { return c.text || ''; }).join('\n');
+  }
+  return JSON.stringify(res);
+}
+
+// 通过 MCP（Streamable HTTP，JSON-RPC）调用 web-read 的 screenshot_url 工具
+async function mcpScreenshot(base, ctrlBase, token) {
+  const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
+  if (token) headers['X-Token'] = token;
+  const initResp = await withTimeout(fetch(base + '/mcp', {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2026-03-26',
+        capabilities: {},
+        clientInfo: { name: 'triangle-score-plugin', version: '1.0.0' }
+      }
+    })
+  }), 20000);
+  const sid = initResp.headers.get('mcp-session-id') || '';
+  await initResp.text();
+  if (!sid) return null;
+  const h2 = Object.assign({}, headers, { 'Mcp-Session-Id': sid });
+  await withTimeout(fetch(base + '/mcp', {
+    method: 'POST',
+    headers: h2,
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
+  }), 15000);
+  const callResp = await withTimeout(fetch(base + '/mcp', {
+    method: 'POST',
+    headers: h2,
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        name: 'screenshot_url',
+        arguments: { url: ctrlBase, width: 1680, height: 1000, fullPage: false, delay: 4500 }
+      }
+    })
+  }), 90000);
+  const text = await callResp.text();
+  const resultText = parseMcpResult(text);
+  // 工具返回的 base64 文本；失败时返回的是错误描述，不是 base64
+  if (resultText && /^[A-Za-z0-9+/=]+$/.test(resultText) && resultText.length > 100) {
+    return resultText;
+  }
+  console.log('[' + ext.name + '] MCP 截图返回异常：' + String(resultText || '').slice(0, 120));
+  return null;
+}
+
 async function takeBoardScreenshot(ctx, msg, fallbackText) {
   const base = getCfg('screenshotUrl').replace(/\/+$/, '');
   const ctrlBase = getCfg('controllerUrl').replace(/\/+$/, '');
   if (!base) return false;
+  const headers = { 'Content-Type': 'application/json' };
+  const token = getCfg('screenshotToken');
+  if (token) headers['X-Token'] = token;
+  let b64 = null;
   try {
-    const headers = { 'Content-Type': 'application/json' };
-    const token = getCfg('screenshotToken');
-    if (token) headers['X-Token'] = token;
     const resp = await withTimeout(fetch(base + '/screenshot', {
       method: 'POST',
       headers: headers,
@@ -592,17 +675,24 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
       }
     }
     if (resp.ok && data && data.base64) {
-      seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + data.base64 + ']');
-      return true;
+      b64 = data.base64;
     }
-    const detail = data && data.message ? data.message : ('HTTP ' + resp.status + (textPreview ? ' ' + textPreview : ''));
-    if (fallbackText) seal.replyToSender(ctx, msg, fallbackText + '（' + detail + '）');
-    return false;
   } catch (e) {
-    console.log('[' + ext.name + '] 网页截图失败：' + (e && e.message ? e.message : e));
-    if (fallbackText) seal.replyToSender(ctx, msg, fallbackText + '（' + (e && e.message ? e.message : e) + '）');
-    return false;
+    console.log('[' + ext.name + '] REST 截图失败，尝试 MCP：' + (e && e.message ? e.message : e));
   }
+  if (!b64) {
+    try {
+      b64 = await mcpScreenshot(base, ctrlBase, token);
+    } catch (e) {
+      console.log('[' + ext.name + '] MCP 截图失败：' + (e && e.message ? e.message : e));
+    }
+  }
+  if (b64) {
+    seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + b64 + ']');
+    return true;
+  }
+  if (fallbackText) seal.replyToSender(ctx, msg, fallbackText);
+  return false;
 }
 
 // ============ 8. 核心上传流程 ============
