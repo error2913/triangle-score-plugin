@@ -387,7 +387,7 @@ async function handleUpload(ctx, msg, replyId) {
   const players = loadPlayers();
   const player = players[String(msg.sender.userId)];
   if (!player) {
-    seal.replyToSender(ctx, msg, '尚未绑定阵营，请先发送：.ts bind attacker 昵称 或 .ts bind defender 昵称');
+    seal.replyToSender(ctx, msg, '尚未绑定阵营，请先发送：.ts bind attacker 或 .ts bind defender');
     return;
   }
 
@@ -485,6 +485,7 @@ cmd.help = [
   '.ts me                      查看本人绑定',
   '.ts list                    查看已绑定选手',
   '.ts board                   查看控制器当前比分/占领情况',
+  '.ts tasks                   查看本局 21 个任务格的歌曲列表',
   '.ts shot                    截取控制器网页当前画面',
   '',
   '上传成绩：引用（回复）一张结算截图，消息文本填「上传成绩」即可'
@@ -584,6 +585,35 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       seal.replyToSender(ctx, msg, lines.join('\n'));
     }).catch(function (e) {
       seal.replyToSender(ctx, msg, '获取控制器状态失败：' + (e && e.message ? e.message : e));
+    });
+    return ret;
+  }
+
+  if (sub === 'tasks') {
+    const base = getCfg('controllerUrl').replace(/\/+$/, '');
+    const mt = getStoredToken(K_MATCH);
+    const tt = getStoredToken(K_ATK) || getStoredToken(K_DEF);
+    if (!mt || !tt) {
+      seal.replyToSender(ctx, msg, '尚未开局，请先发送 .ts start');
+      return ret;
+    }
+    fetch(base + '/api/v1/tasks', {
+      headers: { 'X-Match-Token': mt, 'X-Team-Token': tt }
+    }).then(function (resp) {
+      return resp.json();
+    }).then(function (d) {
+      if (!d || !d.tasks || !d.ok) {
+        seal.replyToSender(ctx, msg, '获取任务列表失败：' + (d && d.message ? d.message : '接口错误'));
+        return;
+      }
+      const lines = d.tasks.map(function (t) {
+        const lv = t.song_level ? ' ' + t.song_level : '';
+        const mark = t.is_l1 ? ' [L1源头]' : (t.occupied_by ? ' [已被' + teamName(t.occupied_by) + '占]' : '');
+        return t.song_name + lv + mark;
+      });
+      seal.replyToSender(ctx, msg, '本局 21 个任务格：\n' + lines.join('\n'));
+    }).catch(function (e) {
+      seal.replyToSender(ctx, msg, '获取任务列表失败：' + (e && e.message ? e.message : e));
     });
     return ret;
   }
