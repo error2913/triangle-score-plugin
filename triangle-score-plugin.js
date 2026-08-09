@@ -1,0 +1,527 @@
+// ==UserScript==
+// @name         triangle-score-plugin
+// @author       错误
+// @version      1.0.0
+// @description  对接「三角占领 · 赛时控制器」成绩上传协议：引用结算截图 → image-recognizer 识别 → 上传成绩 → 渲染结果图片返回
+// @timestamp    2026-08-09
+// @license      MIT
+// @homepageURL  https://github.com/error2913/triangle-score-plugin
+// @updateUrl    https://raw.githubusercontent.com/error2913/triangle-score-plugin/main/triangle-score-plugin.js
+// @depends      错误:image-recognizer:>=1.0.0
+// @sealVersion  1.4.5
+// ==/UserScript==
+
+// 依赖说明：image-recognizer 提供 globalThis.imageRecognizerAPI.recognize(url)，
+// 其内部依赖 ob11 网络连接依赖（globalThis.net 拉图）与 aiplugin4（图片模型识别）。
+// 本插件不再重复依赖这两个插件，由 image-recognizer 的 @depends 传递保证。
+
+// ============ 1. 创建 / 复用扩展 ============
+let ext = seal.ext.find('triangle_score_plugin');
+if (!ext) {
+  ext = seal.ext.new('triangle_score_plugin', '错误', '1.0.0');
+  seal.ext.register(ext);
+}
+
+// ============ 2. 配置项 ============
+seal.ext.registerStringConfig(ext, 'controllerUrl', 'http://127.0.0.1:8000', '赛时控制器地址（协议 Base URL）');
+seal.ext.registerStringConfig(ext, 'matchToken', '', '比赛令牌 X-Match-Token（/api/init 返回 tokens.match）');
+seal.ext.registerStringConfig(ext, 'defenderToken', '', '守护者阵营令牌 X-Team-Token（tokens.defender）');
+seal.ext.registerStringConfig(ext, 'attackerToken', '', '掠夺者阵营令牌 X-Team-Token（tokens.attacker）');
+seal.ext.registerStringConfig(ext, 'renderUrl', 'http://127.0.0.1:37632', 'aiplugin4-backends md-html-render 地址（结果图片渲染）');
+seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
+
+function getCfg(key) {
+  return seal.ext.getStringConfig(ext, key) || '';
+}
+
+// 触发正则（模板逐行过滤后以 | 连接）
+function getTriggerRegex() {
+  const lines = (seal.ext.getTemplateConfig(ext, 'triggerText') || []).filter(function (x) {
+    return x && String(x).trim();
+  });
+  const pattern = lines.join('|');
+  if (pattern) {
+    try {
+      return new RegExp(pattern);
+    } catch (e) {
+      console.log('[' + ext.name + '] 触发正则错误：' + pattern + '，' + (e && e.message ? e.message : e));
+      return /(?!)/;
+    }
+  }
+  return /(?!)/;
+}
+
+// ============ 3. 通用工具 ============
+function withTimeout(promise, ms) {
+  return new Promise(function (resolve, reject) {
+    const timer = setTimeout(function () {
+      reject(new Error('请求超时（' + ms + 'ms）'));
+    }, ms);
+    promise.then(function (v) {
+      clearTimeout(timer);
+      resolve(v);
+    }, function (e) {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
+}
+
+function genMsgId() {
+  return 'ts-' + Date.now() + '-' + Math.floor(Math.random() * 1e12).toString(36);
+}
+
+function getNet() {
+  return globalThis.net || globalThis.http || null;
+}
+
+function toNum(v) {
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  if (typeof v !== 'string') return null;
+  let s = v.trim().replace(/,/g, '').replace(/%/g, '');
+  if (!s || !/^-?\d+(\.\d+)?$/.test(s)) return null;
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+
+function toInt(v) {
+  const n = toNum(v);
+  if (n === null) return null;
+  return Math.floor(n);
+}
+
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ============ 4. 选手身份（持久化：ext.storage 存 JSON） ============
+function loadPlayers() {
+  try {
+    const raw = ext.storageGet('players') || '{}';
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function savePlayers(players) {
+  ext.storageSet('players', JSON.stringify(players));
+}
+
+function bindPlayer(userId, team, name) {
+  const players = loadPlayers();
+  const key = String(userId);
+  const prev = players[key] || {};
+  players[key] = {
+    id: prev.id || 'qq:' + key,
+    name: name || prev.name || key,
+    team: team
+  };
+  savePlayers(players);
+  return players[key];
+}
+
+function unbindPlayer(userId) {
+  const players = loadPlayers();
+  const key = String(userId);
+  const existed = !!players[key];
+  delete players[key];
+  savePlayers(players);
+  return existed;
+}
+
+// ============ 5. 图片获取（引用消息 → ob11 → 图片 URL） ============
+const REPLY_PREFIX_RE = /^\[CQ:reply,id=(-?\d+)[^\]]*\]\s*(?:\[CQ:at,qq=\d+\])?/;
+
+function parseReplyPrefix(text) {
+  if (!text) return null;
+  const m = text.match(REPLY_PREFIX_RE);
+  if (!m) return null;
+  return { replyId: m[1], rest: text.slice(m[0].length) };
+}
+
+function extractImageUrl(text) {
+  if (!text) return null;
+  const m = text.match(/\[CQ:image[^\]]*url=([^,\]\s]+)/i);
+  if (m) return m[1];
+  const f = text.match(/\[CQ:image[^\]]*file=([^,\]\s]+)/i);
+  if (f && /^https?:\/\//i.test(f[1])) return f[1];
+  const b = text.match(/https?:\/\/[^\s<>"\]]+/i);
+  return b ? b[0] : null;
+}
+
+function extractImageFromSegments(message) {
+  if (Array.isArray(message)) {
+    for (let i = 0; i < message.length; i++) {
+      const seg = message[i];
+      if (seg && seg.type === 'image' && seg.data) {
+        const u = seg.data.url || seg.data.file || '';
+        if (u) return u;
+      }
+    }
+    return null;
+  }
+  if (typeof message === 'string') return extractImageUrl(message);
+  return null;
+}
+
+async function fetchQuotedImage(ctx, replyId) {
+  const net = getNet();
+  if (!net || typeof net.callApi !== 'function') {
+    throw new Error('未找到 ob11 网络连接依赖（globalThis.net），无法拉取被引用消息');
+  }
+  const epId = ctx && ctx.endPoint ? ctx.endPoint.userId : '';
+  const data = await withTimeout(net.callApi(epId, 'get_msg', { message_id: Number(replyId) }), 15000);
+  if (!data) return null;
+  const src = extractImageFromSegments(data.message);
+  if (!src) return null;
+  if (/^https?:\/\//i.test(src)) return src;
+  try {
+    const img = await withTimeout(net.callApi(epId, 'get_image', { file: src }), 15000);
+    if (img && img.url) return img.url;
+  } catch (e) {
+    // 忽略，保留原值
+  }
+  return /^https?:\/\//i.test(src) ? src : null;
+}
+
+// ============ 6. 控制器协议调用 ============
+function teamName(team) {
+  return team === 'attacker' ? '掠夺者' : '守护者';
+}
+
+async function postUpload(player, recognized) {
+  const base = getCfg('controllerUrl').replace(/\/+$/, '');
+  const matchToken = getCfg('matchToken');
+  const teamToken = player.team === 'attacker' ? getCfg('attackerToken') : getCfg('defenderToken');
+
+  const result = {};
+  const score = toInt(recognized.score);
+  if (score !== null) result.score = score;
+  const tp = toNum(recognized.tp);
+  if (tp !== null) result.tp = tp;
+  const miss = toInt(recognized.miss);
+  const bad = toInt(recognized.bad);
+  const good = toInt(recognized.good);
+  if (miss !== null) result.miss = miss;
+  if (bad !== null) result.bad = bad;
+  if (good !== null) result.good = good;
+  result.mm = String(recognized.rating || '').toUpperCase() === 'MM';
+  result.full_combo = miss === 0;
+
+  const payload = {
+    api_version: '1',
+    client_msg_id: genMsgId(),
+    team: player.team,
+    player: { id: player.id, name: player.name },
+    song: { name: String(recognized.song || '').trim() },
+    result: result
+  };
+  if (recognized.difficultyLevel != null) payload.song.level = String(recognized.difficultyLevel);
+  if (recognized.difficulty != null) payload.song.type = String(recognized.difficulty);
+
+  const resp = await withTimeout(fetch(base + '/api/v1/results', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Match-Token': matchToken,
+      'X-Team-Token': teamToken
+    },
+    body: JSON.stringify(payload)
+  }), 30000);
+
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch (e) {
+    body = null;
+  }
+  return { status: resp.status, body: body, payload: payload };
+}
+
+function outcomeText(body) {
+  if (!body || !body.ok) return '';
+  const map = {
+    occupied: '占领成功',
+    l1_holder: 'L1 挑战成功',
+    l1_challenged_lost: 'L1 挑战未超过',
+    already_occupied: '该歌曲所在格已被占领',
+    duplicate: '重复上报'
+  };
+  return map[body.outcome] || body.outcome || '';
+}
+
+// ============ 7. 结果图片（aiplugin4-backends md-html-render） ============
+function buildResultCard(player, payload, body, outcome) {
+  const d = body && body.data ? body.data : {};
+  const scores = d.scores || {};
+  const p = payload.player || {};
+  const song = payload.song || {};
+  const r = payload.result || {};
+  const lines = [
+    '<div style="background:#0f1115;color:#eaeaea;font-family:sans-serif;padding:24px 28px;border-radius:12px;width:820px">',
+    '<div style="font-size:24px;font-weight:bold;color:#f0c24b;margin-bottom:14px">三角占领 · 成绩上报</div>',
+    '<div style="font-size:15px;margin-bottom:6px">选手：' + escHtml(p.name || p.id) + '（' + escHtml(teamName(player.team)) + '）</div>',
+    '<div style="font-size:15px;margin-bottom:6px">歌曲：' + escHtml(song.name) + (song.level ? '　难度：' + escHtml(song.level) : '') + '</div>',
+    '<div style="font-size:15px;margin-bottom:12px">得分：' + escHtml(r.score != null ? r.score : '-') + '　TP：' + escHtml(r.tp != null ? r.tp : '-') + '</div>',
+    '<div style="font-size:16px;font-weight:bold;color:' + (body && body.ok ? '#4ade80' : '#f87171') + ';margin-bottom:12px">结果：' + escHtml(outcome || (body && body.message) || '未知') + '</div>',
+    '<div style="font-size:15px;margin-bottom:4px">当前比分：守护者 ' + escHtml(scores.defender != null ? scores.defender : '-') + ' : ' + escHtml(scores.attacker != null ? scores.attacker : '-') + ' 掠夺者</div>',
+    d.event ? '<div style="font-size:12px;color:#8a8f98;margin-top:10px">' + escHtml(d.event) + '</div>' : '',
+    '</div>'
+  ];
+  return lines.join('');
+}
+
+async function sendResultImage(ctx, msg, html, fallbackText) {
+  const renderBase = getCfg('renderUrl').replace(/\/+$/, '');
+  try {
+    const resp = await withTimeout(fetch(renderBase + '/render/html', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ html: html, width: 900, quality: 90 })
+    }), 60000);
+    const data = await resp.json();
+    if (resp.ok && data && data.base64) {
+      seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + data.base64 + ']');
+      return true;
+    }
+  } catch (e) {
+    console.log('[' + ext.name + '] 结果图片渲染失败：' + (e && e.message ? e.message : e));
+  }
+  seal.replyToSender(ctx, msg, fallbackText);
+  return false;
+}
+
+// ============ 8. 核心上传流程 ============
+async function handleUpload(ctx, msg, replyId) {
+  const players = loadPlayers();
+  const player = players[String(msg.sender.userId)];
+  if (!player) {
+    seal.replyToSender(ctx, msg, '尚未绑定阵营，请先发送：.ts bind attacker 昵称 或 .ts bind defender 昵称');
+    return;
+  }
+
+  let url = '';
+  if (replyId) {
+    try {
+      url = await fetchQuotedImage(ctx, replyId);
+    } catch (e) {
+      seal.replyToSender(ctx, msg, '成绩上传失败：' + (e && e.message ? e.message : e));
+      return;
+    }
+  }
+  if (!url) url = extractImageUrl(msg.message || '');
+  if (!url) {
+    seal.replyToSender(ctx, msg, '被引用的消息里没有找到图片');
+    return;
+  }
+
+  seal.replyToSender(ctx, msg, '正在识别结算截图，请稍候…（模型响应慢时可能需要几分钟）');
+
+  const recApi = globalThis.imageRecognizerAPI;
+  if (!recApi || typeof recApi.recognize !== 'function') {
+    seal.replyToSender(ctx, msg, '未找到 image-recognizer 识图接口（globalThis.imageRecognizerAPI），请确认已加载该插件');
+    return;
+  }
+
+  let rec;
+  try {
+    rec = await recApi.recognize(url, { timeoutMs: 420000 });
+  } catch (e) {
+    seal.replyToSender(ctx, msg, '截图识别失败：' + (e && e.message ? e.message : e));
+    return;
+  }
+  if (!rec || !rec.ok || !rec.data) {
+    seal.replyToSender(ctx, msg, '截图识别失败：' + (rec && rec.error ? rec.error : '未返回结构化数据'));
+    return;
+  }
+
+  const d = rec.data;
+  const songName = String(d.song || '').trim();
+  if (!songName || songName === '曲目搜索失败') {
+    seal.replyToSender(ctx, msg, '未识别到有效曲名' + (songName ? '：' + songName : ''));
+    return;
+  }
+  if (!getCfg('matchToken')) {
+    seal.replyToSender(ctx, msg, '比赛令牌未配置（插件设置 → matchToken），请先填入 /api/init 返回的 tokens.match');
+    return;
+  }
+  const teamToken = player.team === 'attacker' ? getCfg('attackerToken') : getCfg('defenderToken');
+  if (!teamToken) {
+    seal.replyToSender(ctx, msg, '阵营令牌未配置（插件设置 → ' + (player.team === 'attacker' ? 'attackerToken' : 'defenderToken') + '）');
+    return;
+  }
+
+  let res;
+  try {
+    res = await postUpload(player, d);
+  } catch (e) {
+    seal.replyToSender(ctx, msg, '成绩上传失败（网络/接口）：' + (e && e.message ? e.message : e));
+    return;
+  }
+
+  const body = res.body;
+  if (res.status >= 400 || !body || !body.ok) {
+    const code = body && body.code ? body.code : 'HTTP ' + res.status;
+    const message = body && body.message ? body.message : '接口错误';
+    seal.replyToSender(ctx, msg, '成绩上传被拒绝：' + code + ' ' + message);
+    return;
+  }
+
+  const outcome = outcomeText(body);
+  const fallbackText = [
+    '三角占领 · 成绩上报',
+    '选手：' + player.name + '（' + teamName(player.team) + '）',
+    '歌曲：' + songName,
+    '结果：' + outcome,
+    body.data && body.data.scores ? '比分：守护者 ' + body.data.scores.defender + ' : ' + body.data.scores.attacker + ' 掠夺者' : '',
+    body.data && body.data.event ? body.data.event : ''
+  ].filter(function (x) { return x; }).join('\n');
+
+  const html = buildResultCard(player, res.payload, body, outcome);
+  await sendResultImage(ctx, msg, html, fallbackText);
+}
+
+// ============ 9. 指令 .ts ============
+const cmd = seal.ext.newCmdItemInfo();
+cmd.name = 'ts';
+cmd.help = [
+  '.ts help                    查看帮助',
+  '.ts status                  查看配置与依赖状态',
+  '.ts bind <attacker|defender> [昵称]   绑定本人阵营（记录选手身份）',
+  '.ts unbind                  解除本人绑定',
+  '.ts me                      查看本人绑定',
+  '.ts list                    查看已绑定选手',
+  '.ts board                   查看控制器当前比分/占领情况',
+  '',
+  '上传成绩：引用（回复）一张结算截图，消息文本填「上传成绩」即可'
+].join('\n');
+cmd.allowDelegate = false;
+cmd.disabledInPrivate = false;
+
+cmd.solve = function (ctx, msg, cmdArgs) {
+  const ret = seal.ext.newCmdExecuteResult(true);
+  const sub = cmdArgs.getArgN(1);
+  const userId = String(msg.sender.userId);
+
+  if (sub === 'help' || sub === undefined || sub === '') {
+    ret.showHelp = true;
+    return ret;
+  }
+
+  if (sub === 'status') {
+    const lines = [
+      '控制器：' + getCfg('controllerUrl'),
+      '比赛令牌：' + (getCfg('matchToken') ? '已配置' : '未配置'),
+      '守护者令牌：' + (getCfg('defenderToken') ? '已配置' : '未配置'),
+      '掠夺者令牌：' + (getCfg('attackerToken') ? '已配置' : '未配置'),
+      '渲染后端：' + getCfg('renderUrl'),
+      '识图接口：' + (globalThis.imageRecognizerAPI ? '可用 v' + (globalThis.imageRecognizerAPI.version || '?') : '缺失（需安装 image-recognizer）'),
+      'ob11 依赖：' + (getNet() ? '可用' : '缺失'),
+      '已绑定选手：' + Object.keys(loadPlayers()).length + ' 人'
+    ];
+    seal.replyToSender(ctx, msg, lines.join('\n'));
+    return ret;
+  }
+
+  if (sub === 'bind') {
+    const teamArg = String(cmdArgs.getArgN(2) || '').toLowerCase();
+    let team = null;
+    if (teamArg === 'attacker' || teamArg === '掠夺者' || teamArg === '红') team = 'attacker';
+    if (teamArg === 'defender' || teamArg === '守护者' || teamArg === '蓝') team = 'defender';
+    if (!team) {
+      seal.replyToSender(ctx, msg, '用法：.ts bind <attacker|defender> [昵称]（attacker=掠夺者/红方，defender=守护者/蓝方）');
+      return ret;
+    }
+    const name = String(cmdArgs.getArgN(3) || '').trim() || ctx.player.name || userId;
+    const p = bindPlayer(userId, team, name);
+    seal.replyToSender(ctx, msg, '已绑定：' + p.name + '（' + teamName(team) + '，ID=' + p.id + '）');
+    return ret;
+  }
+
+  if (sub === 'unbind') {
+    const existed = unbindPlayer(userId);
+    seal.replyToSender(ctx, msg, existed ? '已解除绑定' : '你尚未绑定');
+    return ret;
+  }
+
+  if (sub === 'me') {
+    const p = loadPlayers()[userId];
+    seal.replyToSender(ctx, msg, p ? '选手：' + p.name + '（' + teamName(p.team) + '，ID=' + p.id + '）' : '尚未绑定，请先 .ts bind <attacker|defender> [昵称]');
+    return ret;
+  }
+
+  if (sub === 'list') {
+    const players = loadPlayers();
+    const keys = Object.keys(players);
+    if (keys.length === 0) {
+      seal.replyToSender(ctx, msg, '暂无绑定选手');
+      return ret;
+    }
+    const lines = keys.map(function (k) {
+      const p = players[k];
+      return 'QQ ' + k + '：' + p.name + '（' + teamName(p.team) + '）';
+    });
+    seal.replyToSender(ctx, msg, '已绑定选手（' + keys.length + '）：\n' + lines.join('\n'));
+    return ret;
+  }
+
+  if (sub === 'board') {
+    const base = getCfg('controllerUrl').replace(/\/+$/, '');
+    fetch(base + '/api/state').then(function (resp) {
+      return resp.json();
+    }).then(function (state) {
+      const scores = state.scores || {};
+      const l1 = state.l1 || {};
+      let occupiedDef = 0;
+      let occupiedAtk = 0;
+      const cells = state.board || [];
+      for (let i = 0; i < cells.length; i++) {
+        if (cells[i].owner === 'defender') occupiedDef++;
+        if (cells[i].owner === 'attacker') occupiedAtk++;
+      }
+      const lines = [
+        '三角占领 · 当前状态',
+        '比分：守护者 ' + scores.defender + ' : ' + scores.attacker + ' 掠夺者',
+        '占领：守护者 ' + occupiedDef + ' 格 / 掠夺者 ' + occupiedAtk + ' 格',
+        'L1 持有：' + (l1.holder ? (l1.holder === 'attacker' ? '掠夺者' : '守护者') : '无') + (l1.high_score != null ? '（score=' + l1.high_score + '）' : ''),
+        '已用时：' + (state.elapsed != null ? state.elapsed : '-') + ' 分钟 / 限时 ' + (state.time_limit != null ? state.time_limit : '-') + ' 分钟'
+      ];
+      seal.replyToSender(ctx, msg, lines.join('\n'));
+    }).catch(function (e) {
+      seal.replyToSender(ctx, msg, '获取控制器状态失败：' + (e && e.message ? e.message : e));
+    });
+    return ret;
+  }
+
+  if (sub === 'upload') {
+    const parsed = parseReplyPrefix(msg.message || '');
+    handleUpload(ctx, msg, parsed ? parsed.replyId : null);
+    return ret;
+  }
+
+  ret.showHelp = true;
+  return ret;
+};
+
+ext.cmdMap['ts'] = cmd;
+ext.cmdMap['三角'] = cmd;
+
+// ============ 10. 事件钩子 ============
+ext.onLoad = function () {
+  console.log('[' + ext.name + '] v' + ext.version + ' 已加载');
+};
+
+// 引用截图 + 触发文本（[CQ:reply] 前缀的消息不视为指令，走非指令钩子）
+ext.onNotCommandReceived = function (ctx, msg) {
+  const parsed = parseReplyPrefix(msg.message || '');
+  if (!parsed) return;
+  const regex = getTriggerRegex();
+  if (!regex || !regex.test(parsed.rest)) return;
+  handleUpload(ctx, msg, parsed.replyId);
+};
