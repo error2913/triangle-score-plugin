@@ -744,8 +744,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
   }
 
   if (sub === 'status') {
-    const lines = [
-      '比赛状态：' + (getStoredToken(K_MATCH) ? '已开局（秘钥已记录）' : '未开局（发送 .ts start 开局）'),
+    const baseLines = [
       '控制器：' + (getCfg('controllerUrl') ? '已配置' : '未配置'),
       '截图后端：' + (getCfg('screenshotUrl') ? '已配置' : '未配置'),
       '识图接口：' + (globalThis.imageRecognizerAPI ? '可用 v' + (globalThis.imageRecognizerAPI.version || '?') : '缺失（需安装 image-recognizer）'),
@@ -753,7 +752,33 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       '已绑定选手：' + Object.keys(loadPlayers()).length + ' 人',
       '待审核成绩：' + Object.keys(loadPending()).length + ' 条'
     ];
-    seal.replyToSender(ctx, msg, lines.join('\n'));
+    const base = getCfg('controllerUrl').replace(/\/+$/, '');
+    const reply = function (stateLine) {
+      seal.replyToSender(ctx, msg, stateLine + '\n' + baseLines.join('\n'));
+    };
+    if (!base || !getStoredToken(K_MATCH)) {
+      reply('比赛状态：未开局（发送 .ts start 开局）');
+      return ret;
+    }
+    fetch(base + '/api/state').then(function (resp) {
+      return resp.json();
+    }).then(function (s) {
+      if (!s || !s.started) {
+        reply('比赛状态：未开局（发送 .ts start 开局）');
+        return;
+      }
+      if (s.game_over) {
+        let winner = '已结束';
+        if (s.winner === 'attacker') winner = '已结束（掠夺者获胜）';
+        else if (s.winner === 'defender') winner = '已结束（守护者获胜）';
+        else if (s.winner === 'draw' || s.win_type === 'draw') winner = '已结束（平局）';
+        reply('比赛状态：' + winner);
+        return;
+      }
+      reply('比赛状态：进行中（已用时 ' + Math.floor(s.elapsed || 0) + ' / ' + (s.time_limit != null ? s.time_limit : '?') + ' 分钟）');
+    }).catch(function (e) {
+      reply('比赛状态：未知（控制器不可达）');
+    });
     return ret;
   }
 

@@ -30,6 +30,7 @@ global.fetch = function (url, opts) {
   const u = String(url);
   if (u.includes('/api/init')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, tokens: { match: 'M', defender: 'D', attacker: 'A' }, state: {} }) });
   if (u.includes('/api/end')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
+  if (u.includes('/api/state')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: true, game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 5, time_limit: 25 }) });
   if (u.includes('/api/v1/results')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, code: 'RESULT_PROCESSED', outcome: 'occupied', data: { scores: { defender: 1, attacker: 2 }, event: 'occupy' } }) });
   if (u.includes('/screenshot')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ status: 'success', base64: 'QUJD' }) });
   return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
@@ -108,9 +109,16 @@ setTimeout(() => {
         setTimeout(() => {
           check('admin stop calls /api/end', !!calls.find(c => c.url.includes('/api/end')), '');
           check('stop reply', !!replies.find(r => r.includes('比赛已结束')), replies.join(' | '));
-          const passed = results.filter(Boolean).length;
-          console.log('\n' + passed + '/' + results.length + ' passed');
-          process.exit(passed === results.length ? 0 : 1);
+
+          // 8. status 显示真实比赛状态（已结束）
+          replies.length = 0;
+          ext.cmdMap['ts'].solve(ctx(60), msg('.ts status'), args('status'));
+          setTimeout(() => {
+            check('status shows ended + winner', replies[0].startsWith('比赛状态：已结束（守护者获胜）'), replies[0].split('\n')[0]);
+            const passed = results.filter(Boolean).length;
+            console.log('\n' + passed + '/' + results.length + ' passed');
+            process.exit(passed === results.length ? 0 : 1);
+          }, 80);
         }, 80);
       }, 80);
     }, 80);
