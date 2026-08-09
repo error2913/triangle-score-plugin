@@ -322,6 +322,8 @@ async function startMatchAsync(ctx, msg) {
       ext.storageSet(K_DEF, String(t.defender));
       ext.storageSet(K_ATK, String(t.attacker));
       seal.replyToSender(ctx, msg, '比赛已开始，秘钥已记录（不对外展示）。现在可以引用截图发送「上传成绩」了。');
+      // 开局后也截一张控制器网页图（等待几秒让页面更新）
+      await takeBoardScreenshot(ctx, msg, '控制器截图失败，请检查 screenshotUrl 与 web-read 后端');
     } else {
       seal.replyToSender(ctx, msg, '开局成功但响应缺少 tokens，请确认控制器已包含成绩上传协议（/api/v1）');
     }
@@ -366,7 +368,7 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
         url: ctrlBase,
         width: 1680,
         height: 1000,
-        delay: 3500,
+        delay: 4500,
         fullPage: false
       })
     }), 70000);
