@@ -372,12 +372,22 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
         fullPage: false
       })
     }), 70000);
-    const data = await resp.json();
+    let data = null;
+    let textPreview = '';
+    try {
+      data = await resp.json();
+    } catch (e) {
+      try {
+        textPreview = String(await resp.text() || '').slice(0, 100);
+      } catch (e2) {
+        textPreview = '';
+      }
+    }
     if (resp.ok && data && data.base64) {
       seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + data.base64 + ']');
       return true;
     }
-    const detail = data && data.message ? data.message : 'HTTP ' + resp.status;
+    const detail = data && data.message ? data.message : ('HTTP ' + resp.status + (textPreview ? ' ' + textPreview : ''));
     if (fallbackText) seal.replyToSender(ctx, msg, fallbackText + '（' + detail + '）');
     return false;
   } catch (e) {
