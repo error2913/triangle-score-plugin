@@ -26,6 +26,7 @@ if (!ext) {
 seal.ext.registerStringConfig(ext, 'controllerUrl', 'http://127.0.0.1:8000', '赛时控制器地址（协议 Base URL）');
 seal.ext.registerStringConfig(ext, 'screenshotUrl', 'http://127.0.0.1:46799', '网页截图后端地址（aiplugin4-backends web-read）');
 seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访问令牌（aiplugin4-backends 配置了 token 时填写，请求头 X-Token）');
+seal.ext.registerStringConfig(ext, 'timeApiUrl', 'http://127.0.0.1:8000', '图片时间元数据校验 API 地址（POST /api/image/time，返回拍摄时间）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
 
 // 清理旧版配置项（秘钥已改为开局时由 .ts start 自动获取并存储；renderUrl 已移除，改走网页截图）
@@ -329,6 +330,39 @@ async function submitPayload(payload) {
     body = null;
   }
   return { status: resp.status, body: body, payload: payload };
+}
+
+// 调用图片时间元数据校验 API，返回拍摄时间信息；失败返回 { error }，不抛异常
+async function checkImageTime(imageUrl) {
+  const base = getCfg('timeApiUrl').replace(/\/+$/, '');
+  if (!base) return null;
+  try {
+    const resp = await withTimeout(fetch(base + '/api/image/time', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: imageUrl })
+    }), 25000);
+    let data = null;
+    try {
+      data = await resp.json();
+    } catch (e) {
+      data = null;
+    }
+    if (resp.ok && data) {
+      return {
+        captureUtc: data.capture_time_utc || null,
+        captureLocal: data.capture_time || null,
+        message: data.message || null,
+        entries: (data.time_metadata || []).map(function (e) {
+          return (e.label || e.name) + ' ' + (e.parsed || e.raw);
+        })
+      };
+    }
+    const detail = data && data.detail ? data.detail : ('HTTP ' + resp.status);
+    return { error: String(detail) };
+  } catch (e) {
+    return { error: (e && e.message) ? e.message : String(e) };
+  }
 }
 
 // 开局：调用 /api/init，把返回的三把秘钥存入插件存储（不展示）
@@ -685,6 +719,9 @@ async function handleUpload(ctx, msg, replyId) {
     return;
   }
 
+  // 图片时间校验（拍摄时间 EXIF），失败不阻塞上传流程
+  const timeInfo = await checkImageTime(url);
+
   seal.replyToSender(ctx, msg, '正在识别结算截图，请稍候…（模型响应慢时可能需要几分钟）');
 
   const recApi = globalThis.imageRecognizerAPI;
@@ -748,6 +785,9 @@ async function handleUpload(ctx, msg, replyId) {
       (r.miss != null || r.bad != null || r.good != null
         ? '　miss/bad/good: ' + (r.miss != null ? r.miss : '?') + '/' + (r.bad != null ? r.bad : '?') + '/' + (r.good != null ? r.good : '?')
         : ''),
+    timeInfo && !timeInfo.error
+      ? (timeInfo.captureUtc ? '拍摄时间(UTC)：' + timeInfo.captureUtc : ('拍摄时间：' + (timeInfo.message || '未检测到时间元数据')))
+      : (timeInfo && timeInfo.error ? '时间校验不可用：' + timeInfo.error : ''),
     '',
     '群管理请引用本消息回复：',
     '确认 —— 按以上成绩上传',
@@ -755,7 +795,7 @@ async function handleUpload(ctx, msg, replyId) {
     '拒绝 —— 作废'
   ];
   const sent = await sendConfirmation(ctx, msg, lines.join('\n'));
-  pendings[sent.key] = { code: code, payload: payload, player: player, songName: songName, ts: Date.now(), group: gid };
+  pendings[sent.key] = { code: code, payload: payload, player: player, songName: songName, ts: Date.now(), group: gid, timeInfo: timeInfo };
   savePending(pendings);
 }
 
