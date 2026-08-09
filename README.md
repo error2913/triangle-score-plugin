@@ -9,7 +9,9 @@
   得到曲名 / 难度 / 得分 / TP 等结构化数据；
 - 按成绩上传协议 `POST /api/v1/results` 上传到赛时控制器，自动完成歌曲→格子映射、
   普通格占领与 L1 挑战；
-- 上传结果通过 aiplugin4-backends 的 `md-html-render`（`/render/html`）渲染成图片卡片返回群里；
+- 上传成功后优先**截取控制器网页本身**（aiplugin4-backends web-read `/screenshot`，
+  Puppeteer 无头截图）返回棋盘画面；未配置截图后端时回退到 `md-html-render`
+  渲染的结果图片卡片；
 - 记录选手身份：`QQ → 阵营 + 昵称` 持久化绑定，上传时自动带上选手 ID。
 
 ## 依赖（插件加载依赖链）
@@ -19,6 +21,8 @@
   `AI骰娘4`（图片模型识别，需开启「图片模型」并配置如 `glm-4v-plus`）；
 - 赛时控制器服务（`competition_web/demo`，需已实现 `/api/v1/results` 协议）；
 - aiplugin4-backends 的 `md-html-render` 后端（默认 `http://127.0.0.1:37632`）。
+- 可选：aiplugin4-backends 的 `web-read` 后端（默认 `http://127.0.0.1:46799`），
+  用于对控制器网页截图（需该后端含 `/screenshot` 接口，见 aiplugin4-backends web-read）。
 
 ## 安装
 
@@ -27,7 +31,8 @@
 3. 启动赛时控制器，导入歌曲库并 `POST /api/init` 开局，从返回的 `tokens` 中取得：
    `match`（比赛令牌）、`defender` / `attacker`（阵营令牌）；
 4. 在插件设置中填入：`controllerUrl`、`matchToken`、`defenderToken`、`attackerToken`、
-   `renderUrl`（aiplugin4-backends md-html-render 地址）。
+   `renderUrl`（aiplugin4-backends md-html-render 地址）、`screenshotUrl`
+   （可选，aiplugin4-backends web-read 地址，填了优先返回控制器网页截图）。
 
 ## 使用
 
@@ -40,6 +45,7 @@
 .ts me                             查看本人绑定
 .ts list                           查看已绑定选手
 .ts board                          查看控制器当前比分/占领情况
+.ts shot                           截取控制器网页当前画面
 ```
 
 上传成绩：**引用（回复）一张结算截图**，消息文本填「上传成绩」。

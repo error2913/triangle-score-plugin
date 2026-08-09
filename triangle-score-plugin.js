@@ -28,6 +28,7 @@ seal.ext.registerStringConfig(ext, 'matchToken', '', '比赛令牌 X-Match-Token
 seal.ext.registerStringConfig(ext, 'defenderToken', '', '守护者阵营令牌 X-Team-Token（tokens.defender）');
 seal.ext.registerStringConfig(ext, 'attackerToken', '', '掠夺者阵营令牌 X-Team-Token（tokens.attacker）');
 seal.ext.registerStringConfig(ext, 'renderUrl', 'http://127.0.0.1:37632', 'aiplugin4-backends md-html-render 地址（结果图片渲染）');
+seal.ext.registerStringConfig(ext, 'screenshotUrl', '', '网页截图后端地址（aiplugin4-backends web-read，如 http://127.0.0.1:46799）；留空则用 renderUrl 渲染结果卡片');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
 
 function getCfg(key) {
@@ -297,6 +298,35 @@ async function sendResultImage(ctx, msg, html, fallbackText) {
   return false;
 }
 
+// 对控制器网页本身截图（aiplugin4-backends web-read /screenshot）
+async function takeBoardScreenshot(ctx, msg, fallbackText) {
+  const base = getCfg('screenshotUrl').replace(/\/+$/, '');
+  const ctrlBase = getCfg('controllerUrl').replace(/\/+$/, '');
+  if (!base) return false;
+  try {
+    const resp = await withTimeout(fetch(base + '/screenshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: ctrlBase,
+        width: 1680,
+        height: 1000,
+        delay: 3500,
+        fullPage: false
+      })
+    }), 70000);
+    const data = await resp.json();
+    if (resp.ok && data && data.base64) {
+      seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + data.base64 + ']');
+      return true;
+    }
+  } catch (e) {
+    console.log('[' + ext.name + '] 网页截图失败：' + (e && e.message ? e.message : e));
+  }
+  if (fallbackText) seal.replyToSender(ctx, msg, fallbackText);
+  return false;
+}
+
 // ============ 8. 核心上传流程 ============
 async function handleUpload(ctx, msg, replyId) {
   const players = loadPlayers();
@@ -384,7 +414,12 @@ async function handleUpload(ctx, msg, replyId) {
   ].filter(function (x) { return x; }).join('\n');
 
   const html = buildResultCard(player, res.payload, body, outcome);
-  await sendResultImage(ctx, msg, html, fallbackText);
+  // 先发一行结果文字，再优先返回控制器网页截图；截图后端不可用时回退渲染卡片
+  seal.replyToSender(ctx, msg, '成绩上报完成：' + outcome);
+  const shotOk = await takeBoardScreenshot(ctx, msg, '');
+  if (!shotOk) {
+    await sendResultImage(ctx, msg, html, fallbackText);
+  }
 }
 
 // ============ 9. 指令 .ts ============
@@ -398,6 +433,7 @@ cmd.help = [
   '.ts me                      查看本人绑定',
   '.ts list                    查看已绑定选手',
   '.ts board                   查看控制器当前比分/占领情况',
+  '.ts shot                    截取控制器网页当前画面',
   '',
   '上传成绩：引用（回复）一张结算截图，消息文本填「上传成绩」即可'
 ].join('\n');
@@ -496,6 +532,16 @@ cmd.solve = function (ctx, msg, cmdArgs) {
     }).catch(function (e) {
       seal.replyToSender(ctx, msg, '获取控制器状态失败：' + (e && e.message ? e.message : e));
     });
+    return ret;
+  }
+
+  if (sub === 'shot' || sub === 'screenshot') {
+    if (!getCfg('screenshotUrl')) {
+      seal.replyToSender(ctx, msg, '未配置 screenshotUrl（插件设置），请填写 aiplugin4-backends web-read 地址');
+      return ret;
+    }
+    seal.replyToSender(ctx, msg, '正在截取控制器页面…');
+    takeBoardScreenshot(ctx, msg, '网页截图失败，请检查 screenshotUrl 配置与 web-read 后端状态');
     return ret;
   }
 
