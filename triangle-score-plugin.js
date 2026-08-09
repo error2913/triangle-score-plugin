@@ -377,11 +377,14 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
       seal.replyToSender(ctx, msg, '[CQ:image,file=base64://' + data.base64 + ']');
       return true;
     }
+    const detail = data && data.message ? data.message : 'HTTP ' + resp.status;
+    if (fallbackText) seal.replyToSender(ctx, msg, fallbackText + '（' + detail + '）');
+    return false;
   } catch (e) {
     console.log('[' + ext.name + '] 网页截图失败：' + (e && e.message ? e.message : e));
+    if (fallbackText) seal.replyToSender(ctx, msg, fallbackText + '（' + (e && e.message ? e.message : e) + '）');
+    return false;
   }
-  if (fallbackText) seal.replyToSender(ctx, msg, fallbackText);
-  return false;
 }
 
 // ============ 8. 核心上传流程 ============
