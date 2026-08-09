@@ -39,9 +39,46 @@ try {
 const K_MATCH = 'ts_match_token';
 const K_DEF = 'ts_defender_token';
 const K_ATK = 'ts_attacker_token';
+const K_PENDING = 'ts_pending';
 
 function getStoredToken(key) {
   return ext.storageGet(key) || '';
+}
+
+function loadPending() {
+  try {
+    const o = JSON.parse(ext.storageGet(K_PENDING) || '{}');
+    return o && typeof o === 'object' ? o : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function savePending(p) {
+  ext.storageSet(K_PENDING, JSON.stringify(p));
+}
+
+// 清理超过 15 分钟的待审成绩
+function cleanupPending(now) {
+  const p = loadPending();
+  let changed = false;
+  const keys = Object.keys(p);
+  for (let i = 0; i < keys.length; i++) {
+    if (now - (p[keys[i]].ts || 0) > 900000) {
+      delete p[keys[i]];
+      changed = true;
+    }
+  }
+  if (changed) savePending(p);
+  return p;
+}
+
+function genReviewCode() {
+  return ('0000' + Math.floor(Math.random() * 0xffff).toString(16).toUpperCase()).slice(-4);
+}
+
+function isAdmin(ctx) {
+  return (ctx.privilegeLevel || 0) >= 50; // 群管理/群主/信任/骰主
 }
 
 function getCfg(key) {
@@ -242,11 +279,7 @@ function teamName(team) {
   return team === 'attacker' ? '掠夺者' : '守护者';
 }
 
-async function postUpload(player, recognized) {
-  const base = getCfg('controllerUrl').replace(/\/+$/, '');
-  const matchToken = getStoredToken(K_MATCH);
-  const teamToken = player.team === 'attacker' ? getStoredToken(K_ATK) : getStoredToken(K_DEF);
-
+function buildUploadPayload(player, recognized) {
   const result = {};
   const score = toInt(recognized.score);
   if (score !== null) result.score = score;
@@ -271,6 +304,13 @@ async function postUpload(player, recognized) {
   };
   if (recognized.difficultyLevel != null) payload.song.level = String(recognized.difficultyLevel);
   if (recognized.difficulty != null) payload.song.type = String(recognized.difficulty);
+  return payload;
+}
+
+async function submitPayload(payload) {
+  const base = getCfg('controllerUrl').replace(/\/+$/, '');
+  const matchToken = getStoredToken(K_MATCH);
+  const teamToken = payload.team === 'attacker' ? getStoredToken(K_ATK) : getStoredToken(K_DEF);
 
   const resp = await withTimeout(fetch(base + '/api/v1/results', {
     method: 'POST',
@@ -332,6 +372,48 @@ async function startMatchAsync(ctx, msg) {
   }
 }
 
+// 结束比赛：调用 /api/end，并清空本群待审成绩
+async function stopMatchAsync(ctx, msg) {
+  const base = getCfg('controllerUrl').replace(/\/+$/, '');
+  if (!base) {
+    seal.replyToSender(ctx, msg, '未配置 controllerUrl（插件设置）');
+    return;
+  }
+  seal.replyToSender(ctx, msg, '正在结束比赛…');
+  try {
+    const resp = await withTimeout(fetch(base + '/api/end', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }), 20000);
+    let body = null;
+    try {
+      body = await resp.json();
+    } catch (e) {
+      body = null;
+    }
+    if (resp.status >= 400 || !body || !body.ok) {
+      const message = body && body.message ? body.message : 'HTTP ' + resp.status;
+      seal.replyToSender(ctx, msg, '结束比赛失败：' + message);
+      return;
+    }
+    const gid = String(msg.groupId || 'private:' + msg.sender.userId);
+    const pendings = loadPending();
+    const keys = Object.keys(pendings);
+    let changed = false;
+    for (let i = 0; i < keys.length; i++) {
+      if (String(pendings[keys[i]].group || '') === gid) {
+        delete pendings[keys[i]];
+        changed = true;
+      }
+    }
+    if (changed) savePending(pendings);
+    seal.replyToSender(ctx, msg, '比赛已结束，待审成绩已清空');
+  } catch (e) {
+    seal.replyToSender(ctx, msg, '结束比赛失败（网络/接口）：' + (e && e.message ? e.message : e));
+  }
+}
+
 function outcomeText(body) {
   if (!body || !body.ok) return '';
   const map = {
@@ -342,6 +424,132 @@ function outcomeText(body) {
     duplicate: '重复上报'
   };
   return map[body.outcome] || body.outcome || '';
+}
+
+// 提交成绩并返回结果（确认审核通过后调用）
+async function finalizeUpload(ctx, msg, payload, player, songName) {
+  let res;
+  try {
+    res = await submitPayload(payload);
+  } catch (e) {
+    seal.replyToSender(ctx, msg, '成绩上传失败（网络/接口）：' + (e && e.message ? e.message : e));
+    return;
+  }
+  const body = res.body;
+  if (res.status >= 400 || !body || !body.ok) {
+    const code = body && body.code ? body.code : 'HTTP ' + res.status;
+    const message = body && body.message ? body.message : '接口错误';
+    seal.replyToSender(ctx, msg, '成绩上传被拒绝：' + code + ' ' + message);
+    return;
+  }
+  const outcome = outcomeText(body);
+  const fallbackText = [
+    '三角占领 · 成绩上报',
+    '选手：' + player.name + '（' + teamName(player.team) + '）',
+    '歌曲：' + songName,
+    '结果：' + outcome,
+    body.data && body.data.scores ? '比分：守护者 ' + body.data.scores.defender + ' : ' + body.data.scores.attacker + ' 掠夺者' : '',
+    body.data && body.data.event ? body.data.event : ''
+  ].filter(function (x) { return x; }).join('\n');
+
+  seal.replyToSender(ctx, msg, '成绩上报完成：' + outcome);
+  await takeBoardScreenshot(ctx, msg, fallbackText);
+}
+
+// 群管理审核：引用确认消息回复 确认 / 修改 分数 TP / 拒绝
+async function handleReview(ctx, msg, rest) {
+  if (!isAdmin(ctx)) {
+    seal.replyToSender(ctx, msg, '仅群管理以上可审核成绩');
+    return;
+  }
+  cleanupPending(Date.now());
+  const gid = String(msg.groupId || 'private:' + msg.sender.userId);
+  const pendings = loadPending();
+  const parsed = parseReplyPrefix(msg.message || '');
+  const replyId = parsed ? String(parsed.replyId) : '';
+  let pending = replyId ? pendings[replyId] : null;
+  if (!pending) pending = pendings['group:' + gid] || null;
+  if (!pending) {
+    seal.replyToSender(ctx, msg, '没有找到对应的待审成绩（请引用 bot 发的确认消息回复）');
+    return;
+  }
+  const pkey = replyId && pendings[replyId] ? replyId : 'group:' + gid;
+  const text = String(rest || '').trim();
+  if (/^拒绝/.test(text)) {
+    delete pendings[pkey];
+    savePending(pendings);
+    seal.replyToSender(ctx, msg, '已拒绝该成绩（编号 ' + pending.code + '）');
+    return;
+  }
+  if (/^确认/.test(text)) {
+    delete pendings[pkey];
+    savePending(pendings);
+    await finalizeUpload(ctx, msg, pending.payload, pending.player, pending.songName);
+    return;
+  }
+  if (/^修改/.test(text)) {
+    const payload = pending.payload;
+    const editText = text.replace(/^修改/, '').trim();
+    const edits = {};
+    const editRe = /(score|tp|miss|bad|good|mm|fc)\s*[:=]?\s*(-?\d+(?:\.\d+)?|true|false)/gi;
+    let em = null;
+    while ((em = editRe.exec(editText)) !== null) {
+      const k = em[1].toLowerCase();
+      let v = em[2];
+      if (k === 'mm' || k === 'fc') {
+        v = /^true$/i.test(v);
+      } else {
+        v = Number(v);
+      }
+      edits[k] = v;
+    }
+    const applied = [];
+    if (Object.keys(edits).length > 0) {
+      if (edits.score != null) { payload.result.score = Math.floor(edits.score); applied.push('score=' + payload.result.score); }
+      if (edits.tp != null) { payload.result.tp = edits.tp; applied.push('tp=' + payload.result.tp); }
+      if (edits.miss != null) { payload.result.miss = Math.floor(edits.miss); applied.push('miss=' + payload.result.miss); }
+      if (edits.bad != null) { payload.result.bad = Math.floor(edits.bad); applied.push('bad=' + payload.result.bad); }
+      if (edits.good != null) { payload.result.good = Math.floor(edits.good); applied.push('good=' + payload.result.good); }
+      if (edits.mm != null) { payload.result.mm = edits.mm; applied.push('mm=' + edits.mm); }
+      if (edits.fc != null) { payload.result.full_combo = edits.fc; applied.push('fc=' + edits.fc); }
+    } else {
+      // 兼容旧写法：修改 分数 TP
+      const nums = editText.match(/-?\d+(?:\.\d+)?/g) || [];
+      if (nums.length >= 1) { payload.result.score = Math.floor(Number(nums[0])); applied.push('score=' + payload.result.score); }
+      if (nums.length >= 2) { payload.result.tp = Number(nums[1]); applied.push('tp=' + payload.result.tp); }
+    }
+    delete pendings[pkey];
+    savePending(pendings);
+    if (applied.length > 0) {
+      seal.replyToSender(ctx, msg, '已修改：' + applied.join('，') + '，正在上传…');
+    }
+    await finalizeUpload(ctx, msg, payload, pending.player, pending.songName);
+    return;
+  }
+  seal.replyToSender(ctx, msg, '未识别的审核指令：请回复「确认」「修改 分数 TP」「拒绝」');
+}
+
+// 通过 ob11 发送确认消息并拿回 message_id；失败时回退 replyToSender + 群级 key
+async function sendConfirmation(ctx, msg, text) {
+  const net = getNet();
+  const epId = ctx && ctx.endPoint ? ctx.endPoint.userId : '';
+  if (net && typeof net.callApi === 'function' && msg.messageType === 'group' && msg.groupId) {
+    const gid = String(msg.groupId).replace(/^QQ-Group:/, '').trim();
+    try {
+      const r = await withTimeout(
+        net.callApi(epId, 'send_group_msg', { group_id: Number(gid), message: text }),
+        15000
+      );
+      const data = r && r.data ? r.data : r;
+      if (data && data.message_id != null) {
+        return { key: String(data.message_id), sent: true };
+      }
+    } catch (e) {
+      console.log('[' + ext.name + '] ob11 发送确认消息失败：' + (e && e.message ? e.message : e));
+    }
+  }
+  seal.replyToSender(ctx, msg, text);
+  return { key: 'group:' + String(msg.groupId || 'private:' + msg.sender.userId), sent: false };
 }
 
 async function bindAsync(ctx, msg, team) {
@@ -457,35 +665,42 @@ async function handleUpload(ctx, msg, replyId) {
     return;
   }
 
-  let res;
-  try {
-    res = await postUpload(player, d);
-  } catch (e) {
-    seal.replyToSender(ctx, msg, '成绩上传失败（网络/接口）：' + (e && e.message ? e.message : e));
+  // 生成待审成绩，等群管理确认后才真正上传
+  const payload = buildUploadPayload(player, d);
+  cleanupPending(Date.now());
+  const gid = String(msg.groupId || 'private:' + msg.sender.userId);
+  const pendings = loadPending();
+  const keys = Object.keys(pendings);
+  let exists = false;
+  for (let i = 0; i < keys.length; i++) {
+    if (String(pendings[keys[i]].group || '') === gid) {
+      exists = true;
+      break;
+    }
+  }
+  if (exists) {
+    seal.replyToSender(ctx, msg, '已有成绩待确认，请群管理先处理（引用确认消息回复 确认/修改/拒绝）');
     return;
   }
-
-  const body = res.body;
-  if (res.status >= 400 || !body || !body.ok) {
-    const code = body && body.code ? body.code : 'HTTP ' + res.status;
-    const message = body && body.message ? body.message : '接口错误';
-    seal.replyToSender(ctx, msg, '成绩上传被拒绝：' + code + ' ' + message);
-    return;
-  }
-
-  const outcome = outcomeText(body);
-  const fallbackText = [
-    '三角占领 · 成绩上报',
+  const code = genReviewCode();
+  const r = payload.result;
+  const lines = [
+    '【成绩待确认 · 编号 ' + code + '】',
     '选手：' + player.name + '（' + teamName(player.team) + '）',
-    '歌曲：' + songName,
-    '结果：' + outcome,
-    body.data && body.data.scores ? '比分：守护者 ' + body.data.scores.defender + ' : ' + body.data.scores.attacker + ' 掠夺者' : '',
-    body.data && body.data.event ? body.data.event : ''
-  ].filter(function (x) { return x; }).join('\n');
-
-  // 先发一行结果文字，再截取控制器网页返回；截图失败时回退纯文本
-  seal.replyToSender(ctx, msg, '成绩上报完成：' + outcome);
-  await takeBoardScreenshot(ctx, msg, fallbackText);
+    '歌曲：' + songName + (payload.song.level ? ' 难度 ' + payload.song.level : ''),
+    '得分：' + (r.score != null ? r.score : '-') + '　TP：' + (r.tp != null ? r.tp : '-') +
+      (r.miss != null || r.bad != null || r.good != null
+        ? '　miss/bad/good: ' + (r.miss != null ? r.miss : '?') + '/' + (r.bad != null ? r.bad : '?') + '/' + (r.good != null ? r.good : '?')
+        : ''),
+    '',
+    '群管理请引用本消息回复：',
+    '确认 —— 按以上成绩上传',
+    '修改 <字段> <值> —— 可改 score/tp/miss/bad/good/mm/fc，例：修改 score 991420 / 修改 miss 0 bad 0 good 1',
+    '拒绝 —— 作废'
+  ];
+  const sent = await sendConfirmation(ctx, msg, lines.join('\n'));
+  pendings[sent.key] = { code: code, payload: payload, player: player, songName: songName, ts: Date.now(), group: gid };
+  savePending(pendings);
 }
 
 // ============ 9. 指令 .ts ============
@@ -494,7 +709,8 @@ cmd.name = 'ts';
 cmd.help = [
   '.ts help                    查看帮助',
   '.ts status                  查看配置与依赖状态',
-  '.ts start                   开局并自动记录秘钥（秘钥不展示）',
+  '.ts start                   开局并自动记录秘钥（仅群管理以上）',
+  '.ts stop                    结束比赛（仅群管理以上）',
   '.ts bind <attacker|defender>   绑定本人阵营（昵称自动读取 QQ 昵称）',
   '.ts unbind                  解除本人绑定',
   '.ts me                      查看本人绑定',
@@ -503,7 +719,16 @@ cmd.help = [
   '.ts tasks                   查看本局 21 个任务格的歌曲列表',
   '.ts shot                    截取控制器网页当前画面',
   '',
-  '上传成绩：引用（回复）一张结算截图，消息文本填「上传成绩」即可'
+  '【上传成绩流程】',
+  '1. 引用（回复）一张结算截图，消息文本填「上传成绩」；',
+  '2. bot 发出一条【成绩待确认】消息；',
+  '3. 群管理引用该消息回复：',
+  '   · 确认 —— 按识别成绩上传',
+  '   · 修改 <字段> <值> —— 修改后再上传，字段：score/tp/miss/bad/good/mm/fc',
+  '     例：修改 score 991420 ｜ 修改 miss 0 bad 0 good 1',
+  '   · 拒绝 —— 作废该成绩',
+  '',
+  '说明：.ts start / .ts stop 需要群管理以上权限；审核确认同样仅限群管理。'
 ].join('\n');
 cmd.allowDelegate = false;
 cmd.disabledInPrivate = false;
@@ -525,14 +750,28 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       '截图后端：' + (getCfg('screenshotUrl') ? '已配置' : '未配置'),
       '识图接口：' + (globalThis.imageRecognizerAPI ? '可用 v' + (globalThis.imageRecognizerAPI.version || '?') : '缺失（需安装 image-recognizer）'),
       'ob11 依赖：' + (getNet() ? '可用' : '缺失'),
-      '已绑定选手：' + Object.keys(loadPlayers()).length + ' 人'
+      '已绑定选手：' + Object.keys(loadPlayers()).length + ' 人',
+      '待审核成绩：' + Object.keys(loadPending()).length + ' 条'
     ];
     seal.replyToSender(ctx, msg, lines.join('\n'));
     return ret;
   }
 
   if (sub === 'start') {
+    if (!isAdmin(ctx)) {
+      seal.replyToSender(ctx, msg, '仅群管理以上可开始比赛');
+      return ret;
+    }
     startMatchAsync(ctx, msg);
+    return ret;
+  }
+
+  if (sub === 'stop') {
+    if (!isAdmin(ctx)) {
+      seal.replyToSender(ctx, msg, '仅群管理以上可结束比赛');
+      return ret;
+    }
+    stopMatchAsync(ctx, msg);
     return ret;
   }
 
@@ -665,7 +904,13 @@ ext.onLoad = function () {
 ext.onNotCommandReceived = function (ctx, msg) {
   const parsed = parseReplyPrefix(msg.message || '');
   if (!parsed) return;
+  const rest = String(parsed.rest || '').trim();
+  // 群管理审核：引用确认消息回复 确认 / 修改 / 拒绝
+  if (/^(确认|修改|拒绝)/.test(rest)) {
+    handleReview(ctx, msg, rest);
+    return;
+  }
   const regex = getTriggerRegex();
-  if (!regex || !regex.test(parsed.rest)) return;
+  if (!regex || !regex.test(rest)) return;
   handleUpload(ctx, msg, parsed.replyId);
 };
