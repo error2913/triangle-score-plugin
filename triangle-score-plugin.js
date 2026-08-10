@@ -11,7 +11,7 @@
 // @sealVersion  1.4.5
 // ==/UserScript==
 
-// 依赖说明：image-recognizer 提供 globalThis.imageRecognizerAPI.recognize(url)，
+// 依赖说明：image-recognizer（cy2 特化版）提供 globalThis.imageRecognizerCy2API.recognize(url)，
 // 其内部依赖 ob11 网络连接依赖（globalThis.net 拉图）与 aiplugin4（图片模型识别）。
 // 本插件不再重复依赖这两个插件，由 image-recognizer 的 @depends 传递保证。
 
@@ -877,9 +877,9 @@ async function handleUpload(ctx, msg, replyId) {
 
   seal.replyToSender(ctx, msg, '正在识别结算截图，请稍候…（模型响应慢时可能需要几分钟）');
 
-  const recApi = globalThis.imageRecognizerAPI;
+  const recApi = globalThis.imageRecognizerCy2API;
   if (!recApi || typeof recApi.recognize !== 'function') {
-    seal.replyToSender(ctx, msg, '未找到 image-recognizer 识图接口（globalThis.imageRecognizerAPI），请确认已加载该插件');
+    seal.replyToSender(ctx, msg, '未找到 image-recognizer（cy2 特化版）识图接口（globalThis.imageRecognizerCy2API），请确认已加载该插件');
     return;
   }
 
@@ -1003,7 +1003,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       '网站：' + (siteBase() ? '已配置' : '未配置') + (String(getCfg('competitionId') || '').trim() ? '（比赛ID ' + getCfg('competitionId') + '）' : '（自动当前比赛）'),
       '控制器：' + (getCfg('controllerUrl') ? '已配置' : '未配置'),
       '截图后端：' + (getCfg('screenshotUrl') ? '已配置' : '未配置'),
-      '识图接口：' + (globalThis.imageRecognizerAPI ? '可用 v' + (globalThis.imageRecognizerAPI.version || '?') : '缺失（需安装 image-recognizer）'),
+      '识图接口：' + (globalThis.imageRecognizerCy2API ? '可用 v' + (globalThis.imageRecognizerCy2API.version || '?') : '缺失（需安装 image-recognizer cy2 特化版）'),
       'ob11 依赖：' + (getNet() ? '可用' : '缺失'),
       '待审核成绩：' + pendingCount + ' 条'
     ];

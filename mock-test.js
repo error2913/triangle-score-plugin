@@ -83,7 +83,7 @@ global.fetch = function (url, opts) {
   }
   return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
 };
-globalThis.imageRecognizerAPI = { version: '1.0.0', recognize: () => Promise.resolve({ ok: true, data: { song: '99 Glooms', difficulty: 'CHAOS', difficultyLevel: '14', score: 900000, tp: 90, miss: 0, bad: 0, good: 3, rating: 'S' } }) };
+globalThis.imageRecognizerCy2API = { version: '1.2.4', recognize: () => Promise.resolve({ ok: true, data: { song: '99 Glooms', difficulty: 'CHAOS', difficultyLevel: '14', score: 900000, tp: 90, miss: 0, bad: 0, good: 3, rating: 'S' } }) };
 const netMessages = [];
 let msgIdCounter = 555;
 globalThis.net = {
