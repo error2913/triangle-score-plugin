@@ -2,7 +2,7 @@
 // @name         triangle-score-plugin
 // @author       错误
 // @version      2.0.0
-// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手倒计时开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈
+// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手倒计时开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 结束展示接下来的比赛
 // @timestamp    2026-08-10
 // @license      MIT
 // @homepageURL  https://github.com/error2913/triangle-score-plugin
@@ -26,7 +26,7 @@ if (!ext) {
 seal.ext.registerStringConfig(ext, 'controllerUrl', 'http://127.0.0.1:8001', '赛时控制器地址（协议 Base URL）');
 seal.ext.registerStringConfig(ext, 'screenshotUrl', 'http://127.0.0.1:46799', '网页截图后端地址（aiplugin4-backends web-read）');
 seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访问令牌（aiplugin4-backends 配置了 token 时填写，请求头 X-Token）');
-seal.ext.registerStringConfig(ext, 'siteUrl', 'http://127.0.0.1:8000', '比赛网站地址（拉取赛程 / 赛程图页面）');
+seal.ext.registerStringConfig(ext, 'siteUrl', 'http://127.0.0.1:8000', '比赛网站地址（拉取赛程）');
 seal.ext.registerStringConfig(ext, 'competitionId', '', '比赛 ID（留空自动使用当前进行中的比赛）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
 
@@ -45,7 +45,7 @@ const K_ATK = 'ts_attacker_token';
 const K_PENDING = 'ts_pending';
 const K_COUNTDOWN = 'ts_countdown';       // 倒计时任务（0.5s 循环从存储读取，重载不丢）
 const K_SELECT = 'ts_select';             // 等待管理回复对局 ID 的候选列表
-const K_MATCH_STATE = 'ts_match_state';   // 当前进行中对局（身份/开局时间/赛程图 URL）
+const K_MATCH_STATE = 'ts_match_state';   // 当前进行中对局（身份/开局时间）
 
 function getStoredToken(key) {
   return ext.storageGet(key) || '';
@@ -433,10 +433,33 @@ function buildSides(match) {
   return { attacker: attacker, defender: defender, players: players };
 }
 
-function bracketUrl(competitionId) {
-  const site = siteBase();
-  if (!site || !competitionId) return '';
-  return site + '/competitions/' + competitionId + '/bracket';
+// 结束比赛后展示接下来的比赛（纯文本，不截图）：最多 4 场 + 余量提示
+function matchLine(m) {
+  const a = (m.participant_a && m.participant_a.name) || '待定';
+  const b = (m.participant_b && m.participant_b.name) || '待定';
+  return '第' + m.round_id + '轮 局' + m.id + '：掠夺者「' + a + '」 vs 守护者「' + b + '」';
+}
+
+async function upcomingMatchesText(excludeMatchId) {
+  try {
+    const s = await fetchSchedule();
+    const list = (s.matches || []).filter(function (m) {
+      return m.status === 'pending' && m.id !== excludeMatchId;
+    });
+    if (!list.length) return '';
+    const lines = list.slice(0, 4).map(matchLine);
+    if (list.length > 4) lines.push('……其余 ' + (list.length - 4) + ' 场待赛');
+    return '【接下来的比赛】\n' + lines.join('\n');
+  } catch (e) {
+    return '';
+  }
+}
+
+async function sendUpcomingMatchesAsync(gid, excludeMatchId, emit) {
+  const text = await upcomingMatchesText(excludeMatchId);
+  if (!text) return;
+  if (emit) emit(text);
+  else sendToGroup(gid, text);
 }
 
 // ============ 9. 倒计时 / 结束轮询（0.5s 循环，状态全在存储里，重载不丢） ============
@@ -537,7 +560,6 @@ async function startMatchFromCountdown(cd) {
       roundId: cd.roundId,
       startedAt: Date.now(),
       lastPollAt: 0,
-      bracketUrl: bracketUrl(cd.competitionId),
       attacker: cd.attacker,
       defender: cd.defender,
       players: cd.players
@@ -574,9 +596,7 @@ function tickPoll() {
     clearMatchState();
     clearTokens();
     sendToGroup(st.group, '比赛已结束！' + winnerText(s));
-    if (st.bracketUrl) {
-      sendScreenshotToGroup(st.group, st.bracketUrl, '赛程图获取失败，请手动打开 ' + st.bracketUrl);
-    }
+    sendUpcomingMatchesAsync(st.group, st.matchId);
   }).catch(function (e) {
     console.log('[' + ext.name + '] 轮询控制器状态失败：' + (e && e.message ? e.message : e));
   });
@@ -652,7 +672,7 @@ async function submitPayload(payload) {
   return { status: resp.status, body: body, payload: payload };
 }
 
-// 结束比赛：调用 /api/end，清空本群待审成绩与对局状态，发赛程图
+// 结束比赛：调用 /api/end，清空本群待审成绩与对局状态，展示接下来的比赛
 async function stopMatchAsync(ctx, msg) {
   const base = getCfg('controllerUrl').replace(/\/+$/, '');
   if (!base) {
@@ -692,8 +712,9 @@ async function stopMatchAsync(ctx, msg) {
     if (st && String(st.group) === gid) clearMatchState();
     clearTokens();
     seal.replyToSender(ctx, msg, '比赛已结束，待审成绩已清空');
-    const url = (st && st.bracketUrl) || bracketUrl(String(getCfg('competitionId') || '').trim());
-    if (url) await takeScreenshotFor(ctx, msg, url, '赛程图获取失败，请手动打开 ' + url);
+    await sendUpcomingMatchesAsync(gid, st ? st.matchId : null, function (t) {
+      seal.replyToSender(ctx, msg, t);
+    });
   } catch (e) {
     seal.replyToSender(ctx, msg, '结束比赛失败（网络/接口）：' + (e && e.message ? e.message : e));
   }
@@ -955,7 +976,7 @@ cmd.help = [
   '.ts help                    查看帮助',
   '.ts status                  查看配置 / 倒计时 / 当前对局状态',
   '.ts start                   拉取赛程 → 选择对局 → @选手倒计时开局（仅群管理以上）',
-  '.ts stop                    结束比赛并发送赛程图（仅群管理以上）',
+  '.ts stop                    结束比赛并展示接下来的比赛（仅群管理以上）',
   '.ts board                   查看控制器当前比分/占领情况',
   '.ts tasks                   查看本局 21 个任务格的歌曲列表',
   '.ts shot                    截取控制器网页当前画面',

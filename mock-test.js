@@ -37,7 +37,7 @@ global.seal = {
   getCtxProxyFirst: (ctx) => ctx
 };
 
-// 比赛网站赛程 mock：一场待开始对局（id=1），双方 QQ 1001/1002
+// 比赛网站赛程 mock：两场待开始对局（id=1/2），双方 QQ 1001/1002、1003/1004
 const SCHEDULE = {
   competition: { id: 1, name: '萌新杯测试赛', status: 'ongoing', tournament_format: 'swiss' },
   matches: [
@@ -48,6 +48,14 @@ const SCHEDULE = {
       result_type: null,
       participant_a: { type: 'individual', name: '阿晴', qqs: ['1001'] },
       participant_b: { type: 'individual', name: '小澜', qqs: ['1002'] }
+    },
+    {
+      id: 2,
+      round_id: 1,
+      status: 'pending',
+      result_type: null,
+      participant_a: { type: 'individual', name: '阿星', qqs: ['1003'] },
+      participant_b: { type: 'individual', name: '柚子', qqs: ['1004'] }
     }
   ]
 };
@@ -167,7 +175,7 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('init called after countdown', !!calls.find(c => c.url.includes('/api/init')), '');
     check('match tokens stored', ext.storageGet('ts_match_token') === 'M', '');
     const st = JSON.parse(ext.storageGet('ts_match_state'));
-    check('match state stored (identity+url)', !!st && st.matchId === 1 && st.bracketUrl === 'http://site:8000/competitions/1/bracket' && !!st.players['1001'], JSON.stringify(st));
+    check('match state stored (identity)', !!st && st.matchId === 1 && !st.bracketUrl && !!st.players['1001'], JSON.stringify(st));
     check('started reply + board shot', !!replies.find(r => r.includes('比赛已开始')) && !!replies.find(r => r.startsWith('[CQ:image,file=base64://')), '');
     check('countdown cleared after start', !ext.storageGet('ts_countdown'), '');
 
@@ -240,7 +248,7 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('retry confirm succeeds', !!calls.find(c => c.url.includes('/api/v1/results')), '');
     check('pending cleared after success', !pendingOf('557'), '');
 
-    // ============ 12. stop：权限 + /api/end + 清秘钥 + 赛程图 ============
+    // ============ 12. stop：权限 + /api/end + 清秘钥 + 展示接下来的比赛 ============
     replies.length = 0; calls.length = 0;
     ext.cmdMap['ts'].solve(ctx(0), msg('.ts stop'), args('stop'));
     check('non-admin stop denied', replies[0] === '仅群管理以上可结束比赛', replies[0]);
@@ -250,8 +258,27 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('stop reply', !!replies.find(r => r.includes('比赛已结束')), replies.join(' | '));
     check('stop clears match state', !ext.storageGet('ts_match_state'), '');
     check('stop clears tokens', !ext.storageGet('ts_match_token') && !ext.storageGet('ts_defender_token') && !ext.storageGet('ts_attacker_token'), '');
-    const bracketShot = calls.find(c => c.url.includes('/mcp') && c.opts.body && JSON.parse(c.opts.body).params && JSON.parse(c.opts.body).params.arguments && String(JSON.parse(c.opts.body).params.arguments.url).includes('/competitions/1/bracket'));
-    check('stop sends bracket screenshot', !!bracketShot, calls.filter(c => c.url.includes('/mcp')).map(c => { try { return JSON.parse(c.opts.body).params.arguments.url; } catch (e) { return ''; } }).join(','));
+    const noBracketShot = !calls.find(c => c.url.includes('/mcp') && c.opts.body && JSON.parse(c.opts.body).params && JSON.parse(c.opts.body).params.arguments && String(JSON.parse(c.opts.body).params.arguments.url).includes('/competitions/1/bracket'));
+    check('stop sends no bracket screenshot', noBracketShot, calls.filter(c => c.url.includes('/mcp')).map(c => { try { return JSON.parse(c.opts.body).params.arguments.url; } catch (e) { return ''; } }).join(','));
+    check('stop shows upcoming matches text', !!replies.find(r => r.includes('【接下来的比赛】') && r.includes('局2') && r.includes('阿星') && r.includes('柚子')), replies.join(' | '));
+
+    // ============ 12.5. 自动轮询结束：纯文本结果 + 展示接下来的比赛 ============
+    replies.length = 0; calls.length = 0;
+    ext.storageSet('ts_match_state', JSON.stringify({
+      group: 'QQ-Group:1051905353',
+      competitionId: 1,
+      matchId: 1,
+      roundId: 1,
+      startedAt: Date.now() - 25 * 60 * 1000,
+      lastPollAt: 0,
+      attacker: { name: '阿晴', qqs: ['1001'] },
+      defender: { name: '小澜', qqs: ['1002'] },
+      players: {}
+    }));
+    await sleep(2000);
+    check('auto end sends result text', !!replies.find(r => r.includes('比赛已结束') && r.includes('守护者获胜')), replies.join(' | '));
+    check('auto end shows upcoming matches text', !!replies.find(r => r.includes('【接下来的比赛】') && r.includes('局2') && r.includes('阿星')), replies.join(' | '));
+    check('auto end clears match state', !ext.storageGet('ts_match_state'), '');
 
     // ============ 13. status：无对局 + 待审按群计数 ============
     replies.length = 0;

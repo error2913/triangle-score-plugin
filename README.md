@@ -1,7 +1,7 @@
 # triangle-score-plugin
 
 海豹（SealDice）单文件 JS 插件：从比赛网站拉赛程 → 群内选对局 → @ 选手倒计时开局 →
-引用结算截图上传成绩（人工审核）→ 结束轮询发送赛程图。对接「三角占领 · 赛时控制器」
+引用结算截图上传成绩（人工审核）→ 结束轮询用纯文本展示接下来的比赛。对接「三角占领 · 赛时控制器」
 的成绩上传协议。
 
 ## 功能
@@ -13,8 +13,8 @@
 - 倒计时结束才 `POST /api/init` 开局并自动记录秘钥（不对外展示），发棋盘截图；
 - 选手**引用（回复）结算截图** + 触发词（默认「上传成绩」）→ image-recognizer 识别 →
   bot 发【成绩待确认】消息 → **群管理**引用回复 确认 / 修改 / 拒绝 → 确认后才上传；
-- 开局第 24 分钟起每 30 秒轮询控制器状态，比赛结束自动发送网站赛程图；
-  `.ts stop` 也发送赛程图；
+- 开局第 24 分钟起每 30 秒轮询控制器状态，比赛结束自动用纯文本展示接下来的比赛
+  （最多 4 场 + 余量提示）；`.ts stop` 同样展示；
 - 选手身份不再手动绑定：从赛程名单匹配 `QQ → 昵称 → 阵营`
   （掠夺者=participant_a，守护者=participant_b），QQ 由选手在网站个人资料里自己填。
 
@@ -23,11 +23,11 @@
 - `image-recognizer`（作者 `错误`，≥ 1.0.0）——本插件通过 `@depends` 声明；
 - image-recognizer 自身依赖 `ob11网络连接依赖`（拉取被引用消息图片）与
   `AI骰娘4`（图片模型识别，需开启「图片模型」并配置如 `glm-4v-plus`）；
-- 比赛网站（competition_web，需含赛程只读接口与赛程图页面，见下文「后端运行人需要做什么」）；
+- 比赛网站（competition_web，需含赛程只读接口，见下文「后端运行人需要做什么」）；
 - 赛时控制器服务（`competition_web/demo`，需已实现 `/api/v1/results` 协议与
   `/api/init`、`/api/end`、`/api/state`）；
 - aiplugin4-backends 的 `web-read` 后端（默认 `http://127.0.0.1:46799`，MCP
-  `/mcp` + `screenshot_url` 工具），用于截取控制器网页与赛程图页面。
+  `/mcp` + `screenshot_url` 工具），用于截取控制器网页。
 
 ## 安装
 
@@ -47,7 +47,7 @@
 .ts help      查看帮助
 .ts status    查看配置 / 倒计时 / 当前对局状态
 .ts start     拉取赛程 → 选对局 → @选手倒计时开局（仅群管理以上）
-.ts stop      结束比赛并发送赛程图（仅群管理以上）
+.ts stop      结束比赛并展示接下来的比赛（仅群管理以上）
 .ts board     查看控制器当前比分/占领情况
 .ts tasks     查看本局 21 个任务格的歌曲列表
 .ts shot      截取控制器网页当前画面
@@ -60,7 +60,8 @@
 2. 群管理回复对局 ID（纯数字，120 秒内有效）；
 3. bot @ 全体选手并开始 2 分钟倒计时：剩余 1 分钟提醒一次，最后 3 秒发 3、2、1；
 4. 倒计时结束自动 `POST /api/init` 开局、记录秘钥、发送棋盘截图；
-5. 第 24 分钟起每 30 秒轮询控制器，比赛结束自动发送赛程图；`.ts stop` 同样发送。
+5. 第 24 分钟起每 30 秒轮询控制器，比赛结束自动用纯文本展示接下来的比赛
+   （如「第2轮 局7：掠夺者「X」 vs 守护者「Y」」，最多 4 场）；`.ts stop` 同样展示。
 
 ### 上传成绩（人工审核流程）
 
@@ -92,7 +93,6 @@
 - 赛程接口（网站侧，公开只读）：
   `GET {siteUrl}/api/schedule/current` 或 `GET {siteUrl}/api/competitions/{id}/schedule`，
   返回 `{competition, matches[]}`，每局含 `participant_a/b {type, name, qqs}`；
-- 赛程图页面：`GET {siteUrl}/competitions/{competitionId}/bracket`（HTML，截图用）；
 - 上传端点：`POST {controllerUrl}/api/v1/results`
 - 请求头：`X-Match-Token`（比赛令牌）、`X-Team-Token`（按选手阵营选择）
 - 请求体：`{ api_version, client_msg_id, team, player:{id,name}, song:{name,level,type}, result:{score,tp,mm,full_combo,miss,bad,good} }`
@@ -105,10 +105,11 @@
    `POST {controllerUrl}/api/songs`，请求体为 JSON
    `{"songs": [{"name": "歌名", "type": "Glitch|Chaos|Hard", "level": "难度"}]}`
    （也可以在控制器网页里导入），否则 `.ts start` 开局时会提示先导入歌曲库；
-2. **比赛网站**（competition_web）需更新到含赛程接口与赛程图页面的版本：
+2. **比赛网站**（competition_web）需更新到含赛程只读接口的版本：
    `git pull` 后重启网站服务（8000 端口），验证
-   `GET {siteUrl}/api/schedule/current` 与 `GET {siteUrl}/competitions/{id}/bracket`
-   可访问；比赛需处于 `ongoing` 状态且选手已批准报名、对局已排定（进入 ongoing 时引擎自动生成）；
+   `GET {siteUrl}/api/schedule/current`（或指定比赛
+   `GET {siteUrl}/api/competitions/{id}/schedule`）可访问；比赛需处于 `ongoing`
+   状态且选手已批准报名、对局已排定（进入 ongoing 时引擎自动生成）；
 3. **选手填 QQ**：参赛选手在网站「个人资料」填写 QQ（机器人靠它 @ 与匹配身份）；
 4. **秘钥不需要人工获取**：插件倒计时结束会调 `/api/init` 自动拿并保存。
 
