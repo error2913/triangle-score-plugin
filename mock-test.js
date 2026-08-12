@@ -66,7 +66,10 @@ global.fetch = function (url, opts) {
   const bodyObj = opts && opts.body ? JSON.parse(opts.body) : null;
   if (u.includes('/api/init')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, tokens: { match: 'M', defender: 'D', attacker: 'A' }, state: {} }) });
   if (u.includes('/api/end')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
-  if (u.includes('/api/tick')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ elapsed: 25, time_limit: 25, game_over: true }) });
+  if (u.includes('/api/tick')) {
+    if (global.__TICK_FAIL__) return Promise.reject(new Error('mock: controller unreachable'));
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(global.__TICK_RECOVER__ ? { elapsed: 25, time_limit: 25, game_over: false } : { elapsed: 25, time_limit: 25, game_over: true }) });
+  }
   if (u.includes('/api/state')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: true, game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 5, time_limit: 25 }) });
   if (u.includes('/api/v1/results')) {
     if (global.__RESULTS_FAIL__) return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({ message: 'mock 上传失败' }) });
@@ -121,6 +124,7 @@ const results = [];
 function check(name, cond, detail) { results.push(cond); console.log((cond ? 'PASS' : 'FAIL'), name, detail || ''); }
 function ctx(priv) { return { player: { name: 'x' }, endPoint: { userId: 'QQ:123' }, privilegeLevel: priv, isPrivate: false }; }
 function msg(text, uid, nick) { return { sender: { userId: uid || 'QQ:1001', nickname: nick || '阿晴' }, message: text, messageType: 'group', groupId: 'QQ-Group:1051905353' }; }
+function msgG(text, gid, uid, nick) { return { sender: { userId: uid || 'QQ:1001', nickname: nick || '阿晴' }, message: text, messageType: 'group', groupId: gid }; }
 function args() { const a = Array.prototype.slice.call(arguments); return { getArgN: (n) => a[n - 1] }; }
 const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || '{}'); return k ? p[k] : p; };
 
@@ -329,11 +333,119 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('no REST /screenshot call', !calls.find(c => c.url.includes('/screenshot')), '');
     check('MCP screenshot image reply', !!replies.find(r => r.startsWith('[CQ:image,file=base64://')), '');
 
-    global.__MCP_FAIL__ = true;
-    replies.length = 0; calls.length = 0;
-    ext.cmdMap['ts'].solve(ctx(60), msg('.ts shot'), args('shot'));
-    await sleep(150);
-    check('both fail -> fallback text', !!replies.find(r => r.includes('网页截图失败')), replies.join(' | '));
+  global.__MCP_FAIL__ = true;
+  replies.length = 0; calls.length = 0;
+  ext.cmdMap['ts'].solve(ctx(60), msg('.ts shot'), args('shot'));
+  await sleep(150);
+  check('both fail -> fallback text', !!replies.find(r => r.includes('网页截图失败')), replies.join(' | '));
+  global.__MCP_FAIL__ = false;
+  globalThis.__TS_TEST_SUSPEND__ = true; // 暂停常驻循环，避免后台 tick 干扰后续状态类用例
+
+  // ============ 15. 开局前拦截：双方均未填 QQ 不得开局 ============
+  const backupSchedule = JSON.parse(JSON.stringify(SCHEDULE));
+  SCHEDULE.matches[0].participant_a.qqs = [];
+  SCHEDULE.matches[0].participant_b.qqs = [];
+  ext.storageSet('ts_match_state', '');
+  ext.storageSet('ts_match_token', '');
+  replies.length = 0; calls.length = 0;
+  ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 1'), args('start', '1'));
+  await sleep(150);
+  check('start blocked when both sides lack QQ', !!replies.find(r => r.includes('开局失败：双方选手均未在网站个人资料中填写 QQ')), replies.join(' | '));
+  check('blocked start does not init', !calls.find(c => c.url.includes('/api/init')), '');
+  // 仅一侧缺 QQ：警告但允许继续
+  SCHEDULE.matches[0].participant_b.qqs = ['1002'];
+  replies.length = 0; calls.length = 0;
+  ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 1'), args('start', '1'));
+  await sleep(150);
+  check('one-side missing QQ warns but continues', !!replies.find(r => r.includes('开局警告：掠夺者「阿晴」 未填写 QQ')), replies.join(' | '));
+  check('warn path still calls init', !!calls.find(c => c.url.includes('/api/init')), '');
+  SCHEDULE.matches = JSON.parse(JSON.stringify(backupSchedule.matches));
+  ext.storageSet('ts_match_state', ''); // 清掉警告路径开的局
+  ext.storageSet('ts_match_token', '');
+  ext.storageSet('ts_defender_token', '');
+  ext.storageSet('ts_attacker_token', '');
+
+  // ============ 16. 同群不同选手各自待审 + 同选手重复上传被拒 + 跨群审核被拒 ============
+  const st16 = {
+    group: 'QQ-Group:1051905353', competitionId: 1, competitionName: '萌新杯测试赛',
+    matchId: 1, roundId: 1, startedAt: Date.now(), lastPollAt: 0, timeLimit: 25,
+    attacker: { name: '阿晴', qqs: ['1001'] }, defender: { name: '小澜', qqs: ['1002'] },
+    players: {
+      '1001': { id: '1001', name: '阿晴', team: 'attacker' },
+      '1002': { id: '1002', name: '小澜', team: 'defender' }
+    }
+  };
+  ext.storageSet('ts_match_state', JSON.stringify(st16));
+  ext.storageSet('ts_match_token', 'M');
+  ext.storageSet('ts_defender_token', 'D');
+  ext.storageSet('ts_attacker_token', 'A');
+  ext.storageSet('ts_pending', '{}');
+  netMessages.length = 0; replies.length = 0;
+  ext.onNotCommandReceived(ctx(0), msg('[CQ:reply,id=10]上传成绩', '1001', '阿晴'));
+  await sleep(150);
+  ext.onNotCommandReceived(ctx(0), msg('[CQ:reply,id=11]上传成绩', '1002', '小澜'));
+  await sleep(150);
+  const pendKeys = Object.keys(pendingOf());
+  check('two players can pend simultaneously', pendKeys.length === 2, pendKeys.join(','));
+  replies.length = 0;
+  ext.onNotCommandReceived(ctx(0), msg('[CQ:reply,id=12]上传成绩', '1001', '阿晴'));
+  await sleep(150);
+  check('same player duplicate upload blocked', !!replies.find(r => r.includes('你已有一条成绩待确认')), replies.join(' | '));
+  // 跨群审核：B 群引用 A 群的确认消息 → 拒绝且 pending 保留
+  replies.length = 0;
+  ext.onNotCommandReceived(ctx(60), msgG('[CQ:reply,id=' + pendKeys[0] + ']确认', 'QQ-Group:888', 'QQ:9999', '路人'));
+  await sleep(150);
+  check('cross-group review denied', !!replies.find(r => r.includes('该待审成绩属于其他群，不能在本群审核')), replies.join(' | '));
+  check('cross-group review keeps pending', pendingOf(pendKeys[0]) !== undefined, '');
+  // 本群正常审核可继续
+  replies.length = 0;
+  ext.onNotCommandReceived(ctx(60), msg('[CQ:reply,id=' + pendKeys[0] + ']确认'));
+  await sleep(150);
+  check('own-group review still works', !pendingOf(pendKeys[0]) && !!replies.find(r => r.includes('成绩上报完成')), replies.join(' | '));
+
+  // ============ 17. 轮询失败告警：连续失败 3 次发提示，恢复后计数清零 ============
+  ext.storageSet('ts_match_state', JSON.stringify(Object.assign({}, st16, { startedAt: Date.now() - 25 * 60 * 1000, lastPollAt: 0 })));
+  ext.storageSet('ts_poll_fail', '');
+  replies.length = 0; calls.length = 0;
+  global.__TICK_FAIL__ = true;
+  const forcePoll = function () {
+    const m = JSON.parse(ext.storageGet('ts_match_state'));
+    m.lastPollAt = 0;
+    ext.storageSet('ts_match_state', JSON.stringify(m));
+    internals.tickPoll();
+  };
+  forcePoll(); forcePoll(); forcePoll();
+  await sleep(200); // 等异步 catch 完成
+  check('poll fail count reaches threshold and alerts', !!replies.find(r => r.includes('控制器状态轮询已连续失败 3 次')), replies.join(' | '));
+  const pf = JSON.parse(ext.storageGet('ts_poll_fail') || '{}');
+  check('poll fail state persisted', pf.count === 3 && pf.alerted === true, JSON.stringify(pf));
+  global.__TICK_FAIL__ = false;
+  global.__TICK_RECOVER__ = true; // 恢复轮询返回未结束，避免自动结束清掉状态
+  replies.length = 0;
+  forcePoll();
+  await sleep(200); // 等恢复轮询的 then 链执行完
+  check('poll success clears fail state', !ext.storageGet('ts_poll_fail'), ext.storageGet('ts_poll_fail') || '');
+  check('recovery does not re-alert', !replies.find(r => r.includes('控制器状态轮询已连续失败')), replies.join(' | '));
+
+  // ============ 18. stop 跨群：其他群调用 stop 不清本群 token，status 提示对局在别群 ============
+  ext.storageSet('ts_match_state', JSON.stringify(Object.assign({}, st16, { startedAt: Date.now() })));
+  ext.storageSet('ts_match_token', 'M');
+  ext.storageSet('ts_defender_token', 'D');
+  ext.storageSet('ts_attacker_token', 'A');
+  replies.length = 0;
+  ext.cmdMap['ts'].solve(ctx(60), msgG('.ts stop', 'QQ-Group:888', 'QQ:9999', '路人'), args('stop'));
+  await sleep(150);
+  check('other-group stop keeps tokens', ext.storageGet('ts_match_token') === 'M', '');
+  check('other-group stop keeps match state', !!ext.storageGet('ts_match_state'), '');
+  replies.length = 0;
+  ext.cmdMap['ts'].solve(ctx(60), msgG('.ts status', 'QQ-Group:888', 'QQ:9999', '路人'), args('status'));
+  check('status shows match in other group', replies[0].includes('另一个群正在进行第 1 轮'), replies[0].split('\n')[0]);
+  ext.storageSet('ts_match_state', '');
+  ext.storageSet('ts_match_token', '');
+  ext.storageSet('ts_defender_token', '');
+  ext.storageSet('ts_attacker_token', '');
+  global.__TICK_RECOVER__ = false;
+  globalThis.__TS_TEST_SUSPEND__ = false;
   } finally {
     const passed = results.filter(Boolean).length;
     console.log('\n' + passed + '/' + results.length + ' passed');

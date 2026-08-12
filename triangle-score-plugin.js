@@ -45,6 +45,8 @@ const K_DEF = 'ts_defender_token';
 const K_ATK = 'ts_attacker_token';
 const K_PENDING = 'ts_pending';
 const K_MATCH_STATE = 'ts_match_state';   // 当前进行中对局（身份/开局时间）
+const K_POLL_FAIL = 'ts_poll_fail';        // 轮询连续失败计数（含是否已告警）
+const POLL_FAIL_ALERT_THRESHOLD = 3;       // 连续轮询失败 N 次后向对局群告警
 
 function getStoredToken(key) {
   return ext.storageGet(key) || '';
@@ -70,6 +72,10 @@ function savePending(p) { saveJson(K_PENDING, p); }
 function loadMatchState() { return loadJson(K_MATCH_STATE, null); }
 function saveMatchState(st) { saveJson(K_MATCH_STATE, st); }
 function clearMatchState() { ext.storageSet(K_MATCH_STATE, ''); }
+
+function loadPollFail() { return loadJson(K_POLL_FAIL, { count: 0, alerted: false }); }
+function savePollFail(f) { saveJson(K_POLL_FAIL, f); }
+function clearPollFail() { ext.storageSet(K_POLL_FAIL, ''); }
 
 // 清空本局秘钥（结束 / 停止时调用，避免残留秘钥影响下一局）
 function clearTokens() {
@@ -529,6 +535,7 @@ async function startMatchCore(info, ctx, msg) {
     ext.storageSet(K_MATCH, String(t.match));
     ext.storageSet(K_DEF, String(t.defender));
     ext.storageSet(K_ATK, String(t.attacker));
+    clearPollFail();
     const timeLimit = body.state && body.state.time_limit != null ? Number(body.state.time_limit) : DEFAULT_TIME_LIMIT;
     debugLog('开局成功：matchId=' + info.matchId + ' time_limit=' + timeLimit + '（init 返回 state=' + (body.state ? '有' : '无') + '）');
     saveMatchState({
@@ -580,6 +587,7 @@ function tickPoll() {
     return resp.json();
   }).then(function (s) {
     debugLog('轮询结果：game_over=' + (s && s.game_over) + ' elapsed=' + (s ? s.elapsed : '?') + '/' + (s ? s.time_limit : '?') + ' 字段=' + (s ? Object.keys(s).join(',') : '无响应体'));
+    if (loadPollFail().count > 0) { clearPollFail(); debugLog('轮询恢复成功，失败计数已清零'); }
     if (!s || !s.game_over) return;
     // /api/tick 只返回 elapsed/time_limit/game_over，结束信息（winner/win_type）再拉一次 /api/state
     fetch(base + '/api/state').then(function (r2) {
@@ -598,6 +606,15 @@ function tickPoll() {
     });
   }).catch(function (e) {
     console.log('[' + ext.name + '] 轮询控制器状态失败：' + (e && e.message ? e.message : e) + '（controllerUrl=' + base + '，检查控制器服务是否启动）');
+    const pf = loadPollFail();
+    pf.count = (pf.count || 0) + 1;
+    pf.alerted = false;
+    savePollFail(pf);
+    if (pf.count >= POLL_FAIL_ALERT_THRESHOLD) {
+      pf.alerted = true;
+      savePollFail(pf);
+      sendToGroup(st.group, '控制器状态轮询已连续失败 ' + pf.count + ' 次（' + base + '）。若比赛仍在进行，请群管理联系后端运行人检查控制器是否重启/失联；恢复后插件会自动继续轮询。');
+    }
   });
 }
 
@@ -606,6 +623,7 @@ function tickCleanup() {
 }
 
 function tickLoop() {
+  if (globalThis.__TS_TEST_SUSPEND__ === true) return;
   try { tickPoll(); } catch (e) { console.log('[' + ext.name + '] 轮询循环错误：' + (e && e.message ? e.message : e)); }
   try { tickCleanup(); } catch (e) { console.log('[' + ext.name + '] 清理循环错误：' + (e && e.message ? e.message : e)); }
 }
@@ -676,6 +694,7 @@ async function stopMatchAsync(ctx, msg) {
   }
   const gid = gidOf(msg);
   seal.replyToSender(ctx, msg, '正在结束比赛…');
+  const st = loadMatchState();
   try {
     const resp = await withTimeout(fetch(base + '/api/end', {
       method: 'POST',
@@ -703,9 +722,11 @@ async function stopMatchAsync(ctx, msg) {
       }
     }
     if (changed) savePending(pendings);
-    const st = loadMatchState();
-    if (st && String(st.group) === gid) clearMatchState();
-    clearTokens();
+    if (st && String(st.group) === gid) {
+      clearMatchState();
+      clearTokens();
+      clearPollFail();
+    }
     seal.replyToSender(ctx, msg, '比赛已结束，待审成绩已清空');
     await sendUpcomingMatchesAsync(gid, st ? st.matchId : null, function (t) {
       seal.replyToSender(ctx, msg, t);
@@ -770,12 +791,30 @@ async function handleReview(ctx, msg, rest) {
   const parsed = parseReplyPrefix(msg.message || '');
   const replyId = parsed ? String(parsed.replyId) : '';
   let pending = replyId ? pendings[replyId] : null;
-  if (!pending) pending = pendings['group:' + gid] || null;
+  let pkey = replyId && pendings[replyId] ? replyId : '';
+  if (!pending) {
+    // 无引用回复（ob11 不可用时 bot 直接发出确认文本）：优先匹配本群当前选手的兜底 key
+    for (const k of Object.keys(pendings)) {
+      if (k.startsWith('fallback:' + gid + ':') && String(pendings[k].group || '') === gid) {
+        pending = pendings[k];
+        pkey = k;
+        break;
+      }
+    }
+    // 兼容旧版单条 pending：仅当本群只有一条待审时可按群回退
+    if (!pending && pendings['group:' + gid] && String(pendings['group:' + gid].group || '') === gid) {
+      pending = pendings['group:' + gid];
+      pkey = 'group:' + gid;
+    }
+  }
   if (!pending) {
     seal.replyToSender(ctx, msg, '没有找到对应的待审成绩（请引用 bot 发的确认消息回复）');
     return;
   }
-  const pkey = replyId && pendings[replyId] ? replyId : 'group:' + gid;
+  if (String(pending.group || '') !== gid) {
+    seal.replyToSender(ctx, msg, '该待审成绩属于其他群，不能在本群审核');
+    return;
+  }
   const text = String(rest || '').trim();
   if (/^拒绝/.test(text)) {
     delete pendings[pkey];
@@ -839,8 +878,8 @@ async function handleReview(ctx, msg, rest) {
   seal.replyToSender(ctx, msg, '未识别的审核指令：请回复「确认」「修改 <字段> <值>」「拒绝」');
 }
 
-// 通过 ob11 发送确认消息并拿回 message_id；失败时回退 replyToSender + 群级 key
-async function sendConfirmation(ctx, msg, text) {
+// 通过 ob11 发送确认消息并拿回 message_id；失败时回退 replyToSender + 兜底 key
+async function sendConfirmation(ctx, msg, text, fallbackKey) {
   const net = getNet();
   const epId = ctx && ctx.endPoint ? ctx.endPoint.userId : '';
   if (net && typeof net.callApi === 'function' && msg.messageType === 'group' && msg.groupId) {
@@ -859,7 +898,7 @@ async function sendConfirmation(ctx, msg, text) {
     }
   }
   seal.replyToSender(ctx, msg, text);
-  return { key: 'group:' + gidOf(msg), sent: false };
+  return { key: fallbackKey || ('group:' + gidOf(msg)), sent: false };
 }
 
 // ============ 11. 核心上传流程 ============
@@ -931,16 +970,14 @@ async function handleUpload(ctx, msg, replyId) {
   const payload = buildUploadPayload(player, d);
   cleanupPending(Date.now());
   const pendings = loadPending();
-  const keys = Object.keys(pendings);
-  let exists = false;
-  for (let i = 0; i < keys.length; i++) {
-    if (String(pendings[keys[i]].group || '') === gid) {
-      exists = true;
-      break;
-    }
-  }
-  if (exists) {
-    seal.replyToSender(ctx, msg, '已有成绩待确认，请群管理先处理（引用确认消息回复 确认/修改/拒绝）');
+  // 同群内同一选手同一阵营只允许一条待审，避免重复占用；不同选手可各自上传
+  const dupKey = 'fallback:' + gid + ':' + player.team + ':' + player.id;
+  let dupReplyId = null;
+  Object.keys(pendings).forEach(function (k) {
+    if (dupKey === k || (String(pendings[k].group || '') === gid && pendings[k].player && pendings[k].player.id === player.id && pendings[k].player.team === player.team)) dupReplyId = k;
+  });
+  if (dupReplyId !== null) {
+    seal.replyToSender(ctx, msg, '你已有一条成绩待确认，请群管理先处理（引用对应确认消息回复 确认/修改/拒绝）');
     return;
   }
   const code = genReviewCode();
@@ -959,7 +996,7 @@ async function handleUpload(ctx, msg, replyId) {
     '修改 <字段> <值> —— 可改 score/tp/miss/bad/good/mm/fc，例：修改 score 991420 / 修改 miss 0 bad 0 good 1',
     '拒绝 —— 作废'
   ];
-  const sent = await sendConfirmation(ctx, msg, lines.join('\n'));
+  const sent = await sendConfirmation(ctx, msg, lines.join('\n'), dupKey);
   pendings[sent.key] = { code: code, payload: payload, player: player, songName: songName, ts: Date.now(), group: gid };
   savePending(pendings);
 }
@@ -1023,6 +1060,8 @@ cmd.solve = function (ctx, msg, cmdArgs) {
     ];
     if (st && String(st.group) === gid) {
       lines.unshift('当前对局：第 ' + st.roundId + ' 轮（掠夺者「' + st.attacker.name + '」 vs 守护者「' + st.defender.name + '」）已进行 ' + Math.floor((Date.now() - st.startedAt) / 60000) + ' 分钟');
+    } else if (st) {
+      lines.unshift('当前状态：本群无对局，另一个群正在进行第 ' + st.roundId + ' 轮（同一时刻仅支持一个群跑一局）');
     } else {
       lines.unshift('当前状态：本群无进行中对局（发送 .ts start 开始）');
     }
@@ -1071,6 +1110,16 @@ cmd.solve = function (ctx, msg, cmdArgs) {
           return;
         }
         const sides = buildSides(match);
+        const missingQq = [];
+        if (!sides.attacker.qqs.length) missingQq.push('掠夺者「' + sides.attacker.name + '」');
+        if (!sides.defender.qqs.length) missingQq.push('守护者「' + sides.defender.name + '」');
+        if (!sides.attacker.qqs.length && !sides.defender.qqs.length) {
+          seal.replyToSender(ctx, msg, '开局失败：双方选手均未在网站个人资料中填写 QQ。请选手登录比赛网站填写 QQ 后再发送 .ts start <对局ID> 开局。');
+          return;
+        }
+        if (missingQq.length) {
+          seal.replyToSender(ctx, msg, '开局警告：' + missingQq.join('、') + ' 未填写 QQ，该侧选手将无法上传成绩。建议填写后再开局，仍要继续请再次发送 .ts start <对局ID>。');
+        }
         const ats = sides.attacker.qqs.concat(sides.defender.qqs).map(function (q) {
           return '[CQ:at,qq=' + q + ']';
         }).join(' ');
@@ -1236,6 +1285,7 @@ if (!globalThis.__tsLoopStarted) {
 // mock-test.js 专用测试钩子（仅在测试环境暴露内部函数，不影响海豹运行）
 if (globalThis.__TS_TEST__ === true) {
   globalThis.__TS_TEST__ = {
-    qqNumberFromUserId: qqNumberFromUserId
+    qqNumberFromUserId: qqNumberFromUserId,
+    tickPoll: tickPoll
   };
 }
