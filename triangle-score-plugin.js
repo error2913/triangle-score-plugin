@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         triangle-score-plugin
 // @author       错误
-// @version      2.0.0
+// @version      2.0.1
 // @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 结束展示接下来的比赛
-// @timestamp    2026-08-10
+// @timestamp    2026-08-12
 // @license      MIT
 // @homepageURL  https://github.com/error2913/triangle-score-plugin
 // @updateUrl    https://raw.githubusercontent.com/error2913/triangle-score-plugin/main/triangle-score-plugin.js
@@ -18,7 +18,7 @@
 // ============ 1. 创建 / 复用扩展 ============
 let ext = seal.ext.find('triangle_score_plugin');
 if (!ext) {
-  ext = seal.ext.new('triangle_score_plugin', '错误', '2.0.0');
+  ext = seal.ext.new('triangle_score_plugin', '错误', '2.0.1');
   seal.ext.register(ext);
 }
 
@@ -29,6 +29,7 @@ seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访
 seal.ext.registerStringConfig(ext, 'siteUrl', 'http://127.0.0.1:8000', '比赛网站地址（拉取赛程）');
 seal.ext.registerStringConfig(ext, 'competitionId', '', '比赛 ID（留空自动使用当前进行中的比赛）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
+seal.ext.registerStringConfig(ext, 'debugLog', '1', '调试日志开关：1 打印截图/轮询详情到海豹日志，0 关闭');
 
 // 清理旧版配置项（秘钥已改为开局时自动获取并存储；bind 绑定已删除，身份改从赛程匹配；
 // timeApiUrl 已移除，不做图片时间校验；renderUrl 已移除，改走网页截图）
@@ -102,6 +103,12 @@ function isAdmin(ctx) {
 
 function getCfg(key) {
   return seal.ext.getStringConfig(ext, key) || '';
+}
+
+function debugLog(text) {
+  if (String(getCfg('debugLog') || '1') === '1') {
+    console.log('[' + ext.name + '][DEBUG] ' + text);
+  }
 }
 
 function gidOf(msg) {
@@ -285,51 +292,78 @@ function parseMcpResult(text) {
 
 // 通过 MCP（Streamable HTTP，JSON-RPC）调用 web-read 的 screenshot_url 工具
 async function mcpScreenshot(base, targetUrl, token) {
+  debugLog('MCP 截图开始：base=' + base + ' target=' + targetUrl + ' token=' + (token ? '已配置' : '未配置'));
   const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
   if (token) headers['X-Token'] = token;
-  const initResp = await withTimeout(fetch(base + '/mcp', {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: '2026-03-26',
-        capabilities: {},
-        clientInfo: { name: 'triangle-score-plugin', version: '2.0.0' }
-      }
-    })
-  }), 20000);
+  let initResp;
+  try {
+    initResp = await withTimeout(fetch(base + '/mcp', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2026-03-26',
+          capabilities: {},
+          clientInfo: { name: 'triangle-score-plugin', version: '2.0.1' }
+        }
+      })
+    }), 20000);
+  } catch (e) {
+    console.log('[' + ext.name + '] MCP initialize 请求失败：' + (e && e.message ? e.message : e) + '（screenshotUrl=' + base + '，检查 web-read 后端是否启动、地址端口是否正确）');
+    return null;
+  }
   const sid = initResp.headers.get('mcp-session-id') || '';
-  await initResp.text();
-  if (!sid) return null;
+  const initBody = await initResp.text();
+  debugLog('MCP initialize 响应：HTTP ' + initResp.status + ' sessionId=' + (sid ? '有' : '无') + ' body=' + String(initBody || '').slice(0, 200));
+  if (!sid) {
+    console.log('[' + ext.name + '] MCP initialize 未返回 mcp-session-id（HTTP ' + initResp.status + '）：检查 screenshotUrl 是否指向 web-read 的 /mcp、截图后端是否配置了 token（需在插件填写 screenshotToken）、后端日志是否有报错');
+    return null;
+  }
   const h2 = Object.assign({}, headers, { 'Mcp-Session-Id': sid });
-  await withTimeout(fetch(base + '/mcp', {
-    method: 'POST',
-    headers: h2,
-    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
-  }), 15000);
-  const callResp = await withTimeout(fetch(base + '/mcp', {
-    method: 'POST',
-    headers: h2,
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'tools/call',
-      params: {
-        name: 'screenshot_url',
-        arguments: { url: targetUrl, width: 1680, height: 1000, fullPage: false, delay: 4500 }
-      }
-    })
-  }), 90000);
+  try {
+    await withTimeout(fetch(base + '/mcp', {
+      method: 'POST',
+      headers: h2,
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })
+    }), 15000);
+  } catch (e) {
+    debugLog('MCP notifications/initialized 失败（继续尝试截图）：' + (e && e.message ? e.message : e));
+  }
+  let callResp;
+  try {
+    callResp = await withTimeout(fetch(base + '/mcp', {
+      method: 'POST',
+      headers: h2,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: 'screenshot_url',
+          arguments: { url: targetUrl, width: 1680, height: 1000, fullPage: false, delay: 4500 }
+        }
+      })
+    }), 90000);
+  } catch (e) {
+    console.log('[' + ext.name + '] MCP tools/call 请求失败/超时：' + (e && e.message ? e.message : e) + '（target=' + targetUrl + '，检查截图目标地址控制器是否可达）');
+    return null;
+  }
   const text = await callResp.text();
+  debugLog('MCP tools/call 响应：HTTP ' + callResp.status + ' body前200=' + String(text || '').slice(0, 200));
+  if (callResp.status >= 400) {
+    console.log('[' + ext.name + '] MCP tools/call HTTP ' + callResp.status + '：' + String(text || '').slice(0, 200));
+    return null;
+  }
   const resultText = parseMcpResult(text);
   // 工具返回的 base64 文本；失败时返回的是错误描述，不是 base64
   if (resultText && /^[A-Za-z0-9+/=]+$/.test(resultText) && resultText.length > 100) {
+    debugLog('MCP 截图成功：base64 长度 ' + resultText.length);
     return resultText;
   }
-  console.log('[' + ext.name + '] MCP 截图返回异常：' + String(resultText || '').slice(0, 120));
+  console.log('[' + ext.name + '] MCP 截图返回异常（非 base64）：' + String(resultText || '（空响应）').slice(0, 200));
   return null;
 }
 
@@ -455,8 +489,9 @@ async function sendUpcomingMatchesAsync(gid, excludeMatchId, emit) {
 }
 
 // ============ 9. 开局 / 结束轮询（0.5s 循环，状态全在存储里，重载不丢） ============
-const POLL_START_MS = 24 * 60 * 1000;  // 第 24 分钟才开始轮询
+// 从比赛最后一分钟开始轮询 /api/tick（该接口会触发控制器的超时判定，仅读 /api/state 不会结束比赛）
 const POLL_INTERVAL_MS = 30000;
+const DEFAULT_TIME_LIMIT = 25;
 
 // .ts start <对局ID> 直接开局：POST /api/init 拿秘钥，存对局身份，发棋盘截图
 async function startMatchCore(info, ctx, msg) {
@@ -494,6 +529,8 @@ async function startMatchCore(info, ctx, msg) {
     ext.storageSet(K_MATCH, String(t.match));
     ext.storageSet(K_DEF, String(t.defender));
     ext.storageSet(K_ATK, String(t.attacker));
+    const timeLimit = body.state && body.state.time_limit != null ? Number(body.state.time_limit) : DEFAULT_TIME_LIMIT;
+    debugLog('开局成功：matchId=' + info.matchId + ' time_limit=' + timeLimit + '（init 返回 state=' + (body.state ? '有' : '无') + '）');
     saveMatchState({
       group: info.group,
       competitionId: info.competitionId,
@@ -502,6 +539,7 @@ async function startMatchCore(info, ctx, msg) {
       roundId: info.roundId,
       startedAt: Date.now(),
       lastPollAt: 0,
+      timeLimit: timeLimit,
       attacker: info.attacker,
       defender: info.defender,
       players: info.players
@@ -525,22 +563,41 @@ function tickPoll() {
   const st = loadMatchState();
   if (!st) return;
   const now = Date.now();
-  if (now - (st.startedAt || 0) < POLL_START_MS) return;
+  const pollStartMs = Math.max(0, (st.timeLimit || DEFAULT_TIME_LIMIT) * 60 * 1000 - 60000);
+  const remainingMs = (st.startedAt || now) + pollStartMs - now;
+  if (remainingMs > 0) return;
   if (now - (st.lastPollAt || 0) < POLL_INTERVAL_MS) return;
   st.lastPollAt = now;
   saveMatchState(st);
   const base = getCfg('controllerUrl').replace(/\/+$/, '');
-  if (!base) return;
-  fetch(base + '/api/state').then(function (resp) {
+  if (!base) {
+    console.log('[' + ext.name + '] 轮询跳过：未配置 controllerUrl');
+    return;
+  }
+  debugLog('轮询比赛状态：第 ' + st.roundId + ' 轮 matchId=' + st.matchId + ' 已进行 ' + Math.floor((now - (st.startedAt || now)) / 60000) + ' 分钟 → ' + base + '/api/tick');
+  fetch(base + '/api/tick').then(function (resp) {
+    debugLog('轮询 HTTP ' + resp.status);
     return resp.json();
   }).then(function (s) {
+    debugLog('轮询结果：game_over=' + (s && s.game_over) + ' elapsed=' + (s ? s.elapsed : '?') + '/' + (s ? s.time_limit : '?') + ' 字段=' + (s ? Object.keys(s).join(',') : '无响应体'));
     if (!s || !s.game_over) return;
-    clearMatchState();
-    clearTokens();
-    sendToGroup(st.group, '比赛已结束！' + winnerText(s));
-    sendUpcomingMatchesAsync(st.group, st.matchId);
+    // /api/tick 只返回 elapsed/time_limit/game_over，结束信息（winner/win_type）再拉一次 /api/state
+    fetch(base + '/api/state').then(function (r2) {
+      return r2.json();
+    }).then(function (state) {
+      debugLog('轮询到比赛结束，/api/state winner=' + state.winner + ' win_type=' + state.win_type);
+      clearMatchState();
+      clearTokens();
+      sendToGroup(st.group, '比赛已结束！' + winnerText(state));
+      sendUpcomingMatchesAsync(st.group, st.matchId);
+    }).catch(function (e2) {
+      clearMatchState();
+      clearTokens();
+      sendToGroup(st.group, '比赛已结束！' + winnerText(s));
+      sendUpcomingMatchesAsync(st.group, st.matchId);
+    });
   }).catch(function (e) {
-    console.log('[' + ext.name + '] 轮询控制器状态失败：' + (e && e.message ? e.message : e));
+    console.log('[' + ext.name + '] 轮询控制器状态失败：' + (e && e.message ? e.message : e) + '（controllerUrl=' + base + '，检查控制器服务是否启动）');
   });
 }
 

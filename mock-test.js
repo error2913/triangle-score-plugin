@@ -66,6 +66,7 @@ global.fetch = function (url, opts) {
   const bodyObj = opts && opts.body ? JSON.parse(opts.body) : null;
   if (u.includes('/api/init')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, tokens: { match: 'M', defender: 'D', attacker: 'A' }, state: {} }) });
   if (u.includes('/api/end')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
+  if (u.includes('/api/tick')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ elapsed: 25, time_limit: 25, game_over: true }) });
   if (u.includes('/api/state')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: true, game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 5, time_limit: 25 }) });
   if (u.includes('/api/v1/results')) {
     if (global.__RESULTS_FAIL__) return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({ message: 'mock 上传失败' }) });
@@ -275,11 +276,13 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
       roundId: 1,
       startedAt: Date.now() - 25 * 60 * 1000,
       lastPollAt: 0,
+      timeLimit: 25,
       attacker: { name: '阿晴', qqs: ['1001'] },
       defender: { name: '小澜', qqs: ['1002'] },
       players: {}
     }));
     await sleep(2000);
+    check('auto end polls /api/tick', !!calls.find(c => c.url.includes('/api/tick')), calls.map(c => c.url).join(','));
     check('auto end sends result text', !!replies.find(r => r.includes('比赛已结束') && r.includes('守护者获胜')), replies.join(' | '));
     check('auto end shows upcoming matches text', !!replies.find(r => r.includes('【接下来的比赛】') && r.includes('局2') && r.includes('阿星')), replies.join(' | '));
     check('auto end clears match state', !ext.storageGet('ts_match_state'), '');
