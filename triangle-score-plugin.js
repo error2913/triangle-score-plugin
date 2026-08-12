@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         triangle-score-plugin
 // @author       错误
-// @version      2.0.3
-// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 结束展示接下来的比赛
+// @version      2.1.0
+// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 控制器状态走 WebSocket 推送（自动重连）
 // @timestamp    2026-08-12
 // @license      MIT
 // @homepageURL  https://github.com/error2913/triangle-score-plugin
 // @updateUrl    https://raw.githubusercontent.com/error2913/triangle-score-plugin/main/triangle-score-plugin.js
 // @depends      错误:image-recognizer:>=1.0.0
-// @sealVersion  1.4.5
+// @sealVersion  1.5.1
 // ==/UserScript==
 
 // 依赖说明：image-recognizer（cy2 特化版）提供 globalThis.imageRecognizerCy2API.recognize(url)，
@@ -18,7 +18,7 @@
 // ============ 1. 创建 / 复用扩展 ============
 let ext = seal.ext.find('triangle_score_plugin');
 if (!ext) {
-  ext = seal.ext.new('triangle_score_plugin', '错误', '2.0.2');
+  ext = seal.ext.new('triangle_score_plugin', '错误', '2.1.0');
   seal.ext.register(ext);
 }
 
@@ -29,10 +29,11 @@ seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访
 seal.ext.registerStringConfig(ext, 'siteUrl', 'http://127.0.0.1:8000', '比赛网站地址（拉取赛程）');
 seal.ext.registerStringConfig(ext, 'competitionId', '', '比赛 ID（留空自动使用当前进行中的比赛）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
-seal.ext.registerStringConfig(ext, 'debugLog', '1', '调试日志开关：1 打印截图/轮询详情到海豹日志，0 关闭');
+seal.ext.registerStringConfig(ext, 'debugLog', '1', '调试日志开关：1 打印截图/WS/接口详情到海豹日志，0 关闭');
 
 // 清理旧版配置项（秘钥已改为开局时自动获取并存储；bind 绑定已删除，身份改从赛程匹配；
-// timeApiUrl 已移除，不做图片时间校验；renderUrl 已移除，改走网页截图）
+// timeApiUrl 已移除，不做图片时间校验；renderUrl 已移除，改走网页截图；
+// /api/tick 轮询已移除，控制器状态改走 /ws WebSocket 推送）
 try {
   seal.ext.unregisterConfig(ext, 'matchToken', 'defenderToken', 'attackerToken', 'renderUrl', 'timeApiUrl');
 } catch (e) {
@@ -45,8 +46,6 @@ const K_DEF = 'ts_defender_token';
 const K_ATK = 'ts_attacker_token';
 const K_PENDING = 'ts_pending';
 const K_MATCH_STATE = 'ts_match_state';   // 当前进行中对局（身份/开局时间）
-const K_POLL_FAIL = 'ts_poll_fail';        // 轮询连续失败计数（含是否已告警）
-const POLL_FAIL_ALERT_THRESHOLD = 3;       // 连续轮询失败 N 次后向对局群告警
 
 function getStoredToken(key) {
   return ext.storageGet(key) || '';
@@ -72,10 +71,6 @@ function savePending(p) { saveJson(K_PENDING, p); }
 function loadMatchState() { return loadJson(K_MATCH_STATE, null); }
 function saveMatchState(st) { saveJson(K_MATCH_STATE, st); }
 function clearMatchState() { ext.storageSet(K_MATCH_STATE, ''); }
-
-function loadPollFail() { return loadJson(K_POLL_FAIL, { count: 0, alerted: false }); }
-function savePollFail(f) { saveJson(K_POLL_FAIL, f); }
-function clearPollFail() { ext.storageSet(K_POLL_FAIL, ''); }
 
 // 清空本局秘钥（结束 / 停止时调用，避免残留秘钥影响下一局）
 function clearTokens() {
@@ -183,7 +178,7 @@ function qqNumberFromUserId(userId) {
   return m ? m[1] : '';
 }
 
-// ============ 5. 主动发群消息（轮询回调里没有原始 ctx） ============
+// ============ 5. 主动发群消息（WS / 异步回调里没有原始 ctx） ============
 function sendToGroup(gid, text) {
   const eps = seal.getEndPoints();
   if (!eps || !eps.length) {
@@ -396,7 +391,7 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
   return takeScreenshotFor(ctx, msg, ctrlBase, fallbackText);
 }
 
-// 无原始 ctx（轮询回调）时给群发截图
+// 无原始 ctx（WS / 异步回调）时给群发截图
 async function sendScreenshotToGroup(gid, url, fallbackText) {
   const base = getCfg('screenshotUrl').replace(/\/+$/, '');
   if (!base) {
@@ -496,10 +491,148 @@ async function sendUpcomingMatchesAsync(gid, excludeMatchId, emit) {
   else sendToGroup(gid, text);
 }
 
-// ============ 9. 开局 / 结束轮询（0.5s 循环，状态全在存储里，重载不丢） ============
-// 从比赛最后一分钟开始轮询 /api/tick（该接口会触发控制器的超时判定，仅读 /api/state 不会结束比赛）
-const POLL_INTERVAL_MS = 30000;
+// ============ 9. 开局 / 结束（控制器状态走 WebSocket 推送，超时由后端判定） ============
 const DEFAULT_TIME_LIMIT = 25;
+
+// 控制器 WebSocket：连接 / 重连状态全局共享（热重载时海豹会关闭旧连接，
+// 插件 onLoad 重新连接；用全局标记避免重复建连）。
+const WS_RECONNECT_BASE_MS = 1000;
+const WS_RECONNECT_MAX_MS = 30000;
+const WS_ALERT_THRESHOLD = 3;
+
+function wsState() {
+  if (!globalThis.__tsWsState || typeof globalThis.__tsWsState !== 'object') {
+    globalThis.__tsWsState = { socket: null, retry: 0, timer: null, alerted: false };
+  }
+  return globalThis.__tsWsState;
+}
+
+function controllerWsUrl() {
+  const base = getCfg('controllerUrl').replace(/\/+$/, '');
+  if (!base) return '';
+  return base.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:') + '/ws';
+}
+
+// 指数退避重连：1s → 2s → 4s … 上限 30s；同一时刻只保留一个待重连定时器
+function scheduleWsReconnect() {
+  const st = wsState();
+  if (st.timer) {
+    clearTimeout(st.timer);
+    st.timer = null;
+  }
+  if (!controllerWsUrl()) return;
+  const delay = Math.min(
+    WS_RECONNECT_BASE_MS * Math.pow(2, Math.max(0, (st.retry || 0) - 1)),
+    WS_RECONNECT_MAX_MS
+  );
+  debugLog('控制器 WS 将于 ' + Math.round(delay / 1000) + 's 后重连（连续失败 ' + (st.retry || 0) + ' 次）');
+  st.timer = setTimeout(function () {
+    st.timer = null;
+    ensureControllerWs();
+  }, delay);
+}
+
+// 断线收尾：计数 + 告警 + 排重连（error / close 只处理一次）
+function handleWsClosed(st, ws) {
+  if (st.socket === ws) st.socket = null;
+  st.retry = (st.retry || 0) + 1;
+  if (st.retry >= WS_ALERT_THRESHOLD && !st.alerted) {
+    st.alerted = true;
+    const mst = loadMatchState();
+    const gid = mst && mst.group ? mst.group : '';
+    if (gid) {
+      sendToGroup(gid, '控制器 WebSocket 已连续断开 ' + st.retry + ' 次，插件将自动重连。若比赛仍在进行，请群管理联系后端运行人检查控制器是否重启/失联；恢复后插件会自动继续。');
+    } else {
+      console.log('[' + ext.name + '] 控制器 WS 已连续断开 ' + st.retry + ' 次，将自动重连');
+    }
+  }
+  scheduleWsReconnect();
+}
+
+// 幂等连接：已有 CONNECTING/OPEN 连接时不重复建连；否则丢弃旧连接并新建
+function ensureControllerWs() {
+  const st = wsState();
+  const sock = st.socket;
+  if (sock && (sock.readyState === 0 || sock.readyState === 1)) return;
+  if (sock) {
+    try {
+      sock.onopen = sock.onmessage = sock.onerror = sock.onclose = null;
+      sock.close();
+    } catch (e) {
+      // 旧连接对象已失效时忽略
+    }
+    st.socket = null;
+  }
+  const url = controllerWsUrl();
+  if (!url) {
+    debugLog('WS 跳过：未配置 controllerUrl');
+    return;
+  }
+  let ws = null;
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    console.log('[' + ext.name + '] 创建控制器 WS 失败：' + (e && e.message ? e.message : e));
+    st.retry = (st.retry || 0) + 1;
+    scheduleWsReconnect();
+    return;
+  }
+  st.socket = ws;
+  ws.onopen = function () {
+    st.retry = 0;
+    st.alerted = false;
+    debugLog('控制器 WS 已连接：' + url);
+  };
+  ws.onmessage = function (ev) {
+    let data = null;
+    try {
+      data = JSON.parse(ev && ev.data ? String(ev.data) : '');
+    } catch (e) {
+      data = null;
+    }
+    if (!data || data.type !== 'state_update') return;
+    handleWsStateUpdate(data);
+  };
+  ws.onerror = function (ev) {
+    if (ws.__tsWsHandled) return;
+    ws.__tsWsHandled = true;
+    const err = ev && ev.event && ev.event.error ? ev.event.error : '未知错误';
+    console.log('[' + ext.name + '] 控制器 WS 错误：' + err + '（' + url + '）');
+    handleWsClosed(st, ws);
+  };
+  ws.onclose = function () {
+    if (ws.__tsWsHandled) return;
+    ws.__tsWsHandled = true;
+    debugLog('控制器 WS 已断开：' + url + '（连续失败 ' + (st.retry + 1) + ' 次）');
+    handleWsClosed(st, ws);
+  };
+  debugLog('控制器 WS 连接中：' + url);
+}
+
+// WS 收到 state_update：顺带清理过期待审；game_over 时结束本局并展示接下来的比赛
+function handleWsStateUpdate(state) {
+  try {
+    cleanupPending(Date.now());
+  } catch (e) {
+    // 清理失败不影响状态处理
+  }
+  if (!state || state.game_over !== true) return;
+  const st = loadMatchState();
+  if (!st || !st.group) return;
+  debugLog('WS 收到比赛结束：winner=' + state.winner + ' win_type=' + state.win_type);
+  clearMatchState();
+  clearTokens();
+  sendToGroup(st.group, '比赛已结束！' + winnerText(state));
+  sendUpcomingMatchesAsync(st.group, st.matchId);
+}
+
+function wsStatusText() {
+  const st = wsState();
+  const sock = st.socket;
+  if (sock && sock.readyState === 1) return '已连接';
+  if (sock && sock.readyState === 0) return '连接中';
+  return '断开（重试 ' + (st.retry || 0) + ' 次）';
+}
 
 // .ts start <对局ID> 直接开局：POST /api/init 拿秘钥，存对局身份，发棋盘截图
 async function startMatchCore(info, ctx, msg) {
@@ -538,7 +671,7 @@ async function startMatchCore(info, ctx, msg) {
     ext.storageSet(K_MATCH, String(t.match));
     ext.storageSet(K_DEF, String(t.defender));
     ext.storageSet(K_ATK, String(t.attacker));
-    clearPollFail();
+    ensureControllerWs(); // 确保开局后能收到控制器状态推送（断线时触发重连）
     const timeLimit = body.state && body.state.time_limit != null ? Number(body.state.time_limit) : DEFAULT_TIME_LIMIT;
     debugLog('开局成功：matchId=' + info.matchId + ' time_limit=' + timeLimit + '（init 返回 state=' + (body.state ? '有' : '无') + '）');
     saveMatchState({
@@ -548,7 +681,6 @@ async function startMatchCore(info, ctx, msg) {
       matchId: info.matchId,
       roundId: info.roundId,
       startedAt: Date.now(),
-      lastPollAt: 0,
       timeLimit: timeLimit,
       attacker: info.attacker,
       defender: info.defender,
@@ -567,68 +699,6 @@ function winnerText(s) {
   if (s.winner === 'defender') return '守护者获胜';
   if (s.winner === 'draw' || s.win_type === 'draw') return '平局';
   return '已结束';
-}
-
-function tickPoll() {
-  const st = loadMatchState();
-  if (!st) return;
-  const now = Date.now();
-  const pollStartMs = Math.max(0, (st.timeLimit || DEFAULT_TIME_LIMIT) * 60 * 1000 - 60000);
-  const remainingMs = (st.startedAt || now) + pollStartMs - now;
-  if (remainingMs > 0) return;
-  if (now - (st.lastPollAt || 0) < POLL_INTERVAL_MS) return;
-  st.lastPollAt = now;
-  saveMatchState(st);
-  const base = getCfg('controllerUrl').replace(/\/+$/, '');
-  if (!base) {
-    console.log('[' + ext.name + '] 轮询跳过：未配置 controllerUrl');
-    return;
-  }
-  debugLog('轮询比赛状态：第 ' + st.roundId + ' 轮 matchId=' + st.matchId + ' 已进行 ' + Math.floor((now - (st.startedAt || now)) / 60000) + ' 分钟 → ' + base + '/api/tick');
-  fetch(base + '/api/tick').then(function (resp) {
-    debugLog('轮询 HTTP ' + resp.status);
-    return resp.json();
-  }).then(function (s) {
-    debugLog('轮询结果：game_over=' + (s && s.game_over) + ' elapsed=' + (s ? s.elapsed : '?') + '/' + (s ? s.time_limit : '?') + ' 字段=' + (s ? Object.keys(s).join(',') : '无响应体'));
-    if (loadPollFail().count > 0) { clearPollFail(); debugLog('轮询恢复成功，失败计数已清零'); }
-    if (!s || !s.game_over) return;
-    // /api/tick 只返回 elapsed/time_limit/game_over，结束信息（winner/win_type）再拉一次 /api/state
-    fetch(base + '/api/state').then(function (r2) {
-      return r2.json();
-    }).then(function (state) {
-      debugLog('轮询到比赛结束，/api/state winner=' + state.winner + ' win_type=' + state.win_type);
-      clearMatchState();
-      clearTokens();
-      sendToGroup(st.group, '比赛已结束！' + winnerText(state));
-      sendUpcomingMatchesAsync(st.group, st.matchId);
-    }).catch(function (e2) {
-      clearMatchState();
-      clearTokens();
-      sendToGroup(st.group, '比赛已结束！' + winnerText(s));
-      sendUpcomingMatchesAsync(st.group, st.matchId);
-    });
-  }).catch(function (e) {
-    console.log('[' + ext.name + '] 轮询控制器状态失败：' + (e && e.message ? e.message : e) + '（controllerUrl=' + base + '，检查控制器服务是否启动）');
-    const pf = loadPollFail();
-    pf.count = (pf.count || 0) + 1;
-    pf.alerted = false;
-    savePollFail(pf);
-    if (pf.count >= POLL_FAIL_ALERT_THRESHOLD) {
-      pf.alerted = true;
-      savePollFail(pf);
-      sendToGroup(st.group, '控制器状态轮询已连续失败 ' + pf.count + ' 次（' + base + '）。若比赛仍在进行，请群管理联系后端运行人检查控制器是否重启/失联；恢复后插件会自动继续轮询。');
-    }
-  });
-}
-
-function tickCleanup() {
-  cleanupPending(Date.now());
-}
-
-function tickLoop() {
-  if (globalThis.__TS_TEST_SUSPEND__ === true) return;
-  try { tickPoll(); } catch (e) { console.log('[' + ext.name + '] 轮询循环错误：' + (e && e.message ? e.message : e)); }
-  try { tickCleanup(); } catch (e) { console.log('[' + ext.name + '] 清理循环错误：' + (e && e.message ? e.message : e)); }
 }
 
 // ============ 10. 控制器协议调用 ============
@@ -731,7 +801,6 @@ async function stopMatchAsync(ctx, msg) {
     if (st && String(st.group) === gid) {
       clearMatchState();
       clearTokens();
-      clearPollFail();
     }
     seal.replyToSender(ctx, msg, alreadyEnded ? '比赛已结束（控制器此前已判定结束），待审成绩已清空' : '比赛已结束，待审成绩已清空');
     await sendUpcomingMatchesAsync(gid, st ? st.matchId : null, function (t) {
@@ -1019,6 +1088,7 @@ cmd.help = [
   '.ts board                   查看控制器当前比分/占领情况',
   '.ts tasks                   查看本局 21 个任务格的歌曲列表',
   '.ts shot                    截取控制器网页当前画面',
+  '.ts reconnect               手动重连控制器 WebSocket（断线后插件会自动重试）',
   '',
   '【开局流程】',
   '1. 群管理发送 .ts start，bot 列出候选对局（含双方与 QQ）；',
@@ -1061,6 +1131,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
     const lines = [
       '网站：' + (siteBase() ? '已配置' : '未配置') + (String(getCfg('competitionId') || '').trim() ? '（比赛ID ' + getCfg('competitionId') + '）' : '（自动当前比赛）'),
       '控制器：' + (getCfg('controllerUrl') ? '已配置' : '未配置'),
+      '控制器 WS：' + wsStatusText(),
       '截图后端：' + (getCfg('screenshotUrl') ? '已配置' : '未配置'),
       '识图接口：' + (globalThis.imageRecognizerCy2API ? '可用 v' + (globalThis.imageRecognizerCy2API.version || '?') : '缺失（需安装 image-recognizer cy2 特化版）'),
       'ob11 依赖：' + (getNet() ? '可用' : '缺失'),
@@ -1074,6 +1145,29 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       lines.unshift('当前状态：本群无进行中对局（发送 .ts start 开始）');
     }
     seal.replyToSender(ctx, msg, lines.join('\n'));
+    return ret;
+  }
+
+  if (sub === 'reconnect') {
+    const st = wsState();
+    if (st.timer) {
+      clearTimeout(st.timer);
+      st.timer = null;
+    }
+    const old = st.socket;
+    if (old) {
+      try {
+        old.onopen = old.onmessage = old.onerror = old.onclose = null;
+        old.close();
+      } catch (e) {
+        // 旧连接对象已失效时忽略
+      }
+      st.socket = null;
+    }
+    st.retry = 0;
+    st.alerted = false;
+    ensureControllerWs();
+    seal.replyToSender(ctx, msg, '正在重新连接控制器 WebSocket…（当前状态：' + wsStatusText() + '）');
     return ret;
   }
 
@@ -1248,16 +1342,20 @@ ext.onLoad = function () {
   const pendingCount = Object.keys(pendings).filter(function (k) {
     return String(pendings[k].group || '');
   }).length;
+  try {
+    ensureControllerWs(); // 插件加载即连接控制器 WS；重载后海豹已关掉旧连接，这里会重建
+  } catch (e) {
+    console.log('[' + ext.name + '] 初始化控制器 WS 失败：' + (e && e.message ? e.message : e));
+  }
   if (st && st.group) {
     const now = Date.now();
-    const pollStartMs = Math.max(0, (st.timeLimit || DEFAULT_TIME_LIMIT) * 60 * 1000 - 60000);
-    const remainSec = Math.max(0, Math.ceil(((st.startedAt || now) + pollStartMs - now) / 1000));
     console.log('[' + ext.name + '] v' + ext.version + ' 已加载：检测到进行中对局（第 ' + st.roundId + ' 轮，已进行 ' +
-      Math.floor((now - (st.startedAt || now)) / 60000) + ' 分钟，' +
-      (remainSec > 0 ? '约 ' + Math.ceil(remainSec / 60) + ' 分钟后进入轮询窗口' : '已进入轮询窗口，恢复轮询') +
-      '）' + (pendingCount ? '，待审成绩 ' + pendingCount + ' 条' : '，无待审成绩') + '。热重载不影响比赛继续');
+      Math.floor((now - (st.startedAt || now)) / 60000) + ' 分钟）' +
+      (pendingCount ? '，待审成绩 ' + pendingCount + ' 条' : '，无待审成绩') +
+      '。超时由控制器后台自动判定，热重载不影响比赛继续；控制器 WS：' + wsStatusText());
   } else {
-    console.log('[' + ext.name + '] v' + ext.version + ' 已加载（无进行中对局）' + (pendingCount ? '，待审成绩 ' + pendingCount + ' 条' : ''));
+    console.log('[' + ext.name + '] v' + ext.version + ' 已加载（无进行中对局）' +
+      (pendingCount ? '，待审成绩 ' + pendingCount + ' 条' : '') + '；控制器 WS：' + wsStatusText());
   }
 };
 
@@ -1281,18 +1379,14 @@ ext.onNotCommandReceived = function (ctx, msg) {
   }
 };
 
-// 0.5s 常驻循环：结束轮询 / 清理。状态全部在存储里，插件重载后继续跑；
-// 用全局标记防止热重载重复启动循环。
-if (!globalThis.__tsLoopStarted) {
-  globalThis.__tsLoopStarted = true;
-  setInterval(tickLoop, 500);
-  console.log('[' + ext.name + '] 0.5s 常驻循环已启动（轮询/清理）');
-}
-
 // mock-test.js 专用测试钩子（仅在测试环境暴露内部函数，不影响海豹运行）
 if (globalThis.__TS_TEST__ === true) {
   globalThis.__TS_TEST__ = {
     qqNumberFromUserId: qqNumberFromUserId,
-    tickPoll: tickPoll
+    handleWsStateUpdate: handleWsStateUpdate,
+    ensureControllerWs: ensureControllerWs,
+    scheduleWsReconnect: scheduleWsReconnect,
+    wsStatusText: wsStatusText,
+    controllerWsUrl: controllerWsUrl
   };
 }

@@ -69,10 +69,6 @@ global.fetch = function (url, opts) {
     if (global.__END_ALREADY_OVER__) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: false, state: { started: true, game_over: true, winner: 'draw', win_type: 'timeout' } }) });
     return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
   }
-  if (u.includes('/api/tick')) {
-    if (global.__TICK_FAIL__) return Promise.reject(new Error('mock: controller unreachable'));
-    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(global.__TICK_RECOVER__ ? { elapsed: 25, time_limit: 25, game_over: false } : { elapsed: 25, time_limit: 25, game_over: true }) });
-  }
   if (u.includes('/api/state')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ started: true, game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 5, time_limit: 25 }) });
   if (u.includes('/api/v1/results')) {
     if (global.__RESULTS_FAIL__) return Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({ message: 'mock 上传失败' }) });
@@ -112,15 +108,59 @@ globalThis.net = {
   }
 };
 
+// 控制器 WebSocket 模拟：构造函数后异步 open（或 global.__WS_FAIL__ 时异步失败），
+// 提供 fail()/receive() 供测试驱动断开与状态推送。
+class MockWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.readyState = MockWebSocket.CONNECTING;
+    this.onopen = this.onmessage = this.onerror = this.onclose = null;
+    MockWebSocket.instances.push(this);
+    setTimeout(() => {
+      if (this.readyState !== MockWebSocket.CONNECTING) return;
+      if (global.__WS_FAIL__) {
+        this.readyState = MockWebSocket.CLOSED;
+        if (this.onerror) this.onerror({ type: 'error', event: { error: 'mock connection failed' }, target: this, currentTarget: this });
+        if (this.onclose) this.onclose({ type: 'close', code: 1006, reason: 'connection lost', wasClean: false, target: this, currentTarget: this });
+        return;
+      }
+      this.readyState = MockWebSocket.OPEN;
+      if (this.onopen) this.onopen({ type: 'open', target: this, currentTarget: this });
+    }, 5);
+  }
+  close() {
+    if (this.readyState === MockWebSocket.CLOSED) return;
+    this.readyState = MockWebSocket.CLOSED;
+    if (this.onclose) this.onclose({ type: 'close', code: 1000, reason: '', wasClean: true, target: this, currentTarget: this });
+  }
+  receive(data) {
+    if (this.onmessage) this.onmessage({ type: 'message', data: data, target: this, currentTarget: this });
+  }
+  fail() {
+    if (this.readyState === MockWebSocket.CLOSED) return;
+    this.readyState = MockWebSocket.CLOSED;
+    if (this.onerror) this.onerror({ type: 'error', event: { error: 'mock connection lost' }, target: this, currentTarget: this });
+    if (this.onclose) this.onclose({ type: 'close', code: 1006, reason: 'connection lost', wasClean: false, target: this, currentTarget: this });
+  }
+}
+MockWebSocket.CONNECTING = 0;
+MockWebSocket.OPEN = 1;
+MockWebSocket.CLOSING = 2;
+MockWebSocket.CLOSED = 3;
+MockWebSocket.instances = [];
+global.WebSocket = MockWebSocket;
+
 // 暴露插件内部函数供测试（插件在 __TS_TEST__ === true 时挂到 globalThis）
 globalThis.__TS_TEST__ = true;
 require(path);
 const ext = exts['triangle_score_plugin'];
-const internals = globalThis.__TS_TEST__;
+let internals = globalThis.__TS_TEST__;
 // 配置：网站 + 控制器 + 截图后端
 ext.configs.siteUrl.val = 'http://site:8000';
 ext.configs.controllerUrl.val = 'http://ctrl:8001';
 ext.configs.screenshotUrl.val = 'http://shot:46799';
+// 插件加载：onLoad 会立即尝试连接控制器 WS
+ext.onLoad();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
@@ -139,6 +179,15 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('qq parse QQ-Group', internals.qqNumberFromUserId('QQ-Group:1051905353:3837233349') === '3837233349', internals.qqNumberFromUserId('QQ-Group:1051905353:3837233349'));
     check('qq parse QQ-Guild', internals.qqNumberFromUserId('QQ-Guild:123:456') === '456', internals.qqNumberFromUserId('QQ-Guild:123:456'));
     check('qq parse empty', internals.qqNumberFromUserId('') === '', internals.qqNumberFromUserId(''));
+
+    // ============ 0b. 控制器 WS：onLoad 即连接 ============
+    await sleep(30);
+    const ws0 = globalThis.__tsWsState && globalThis.__tsWsState.socket;
+    check('onLoad connects controller WS', !!ws0 && ws0.readyState === 1, ws0 ? ws0.url : '无连接');
+    check('ws url derived from controllerUrl', !!ws0 && ws0.url === 'ws://ctrl:8001/ws', ws0 ? ws0.url : '');
+    replies.length = 0;
+    ext.cmdMap['ts'].solve(ctx(60), msg('.ts status'), args('status'));
+    check('status shows WS connected', !!replies[0] && replies[0].includes('控制器 WS：已连接'), replies[0] ? replies[0].split('\n').find(l => l.includes('控制器 WS')) : '');
 
     // ============ 1. 权限：非管理不能 start ============
     replies.length = 0;
@@ -260,26 +309,29 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('retry confirm succeeds', !!calls.find(c => c.url.includes('/api/v1/results')), '');
     check('pending cleared after success', !pendingOf('557'), '');
 
-    // ============ 11.5. 热重载模拟：状态保留、循环不重复、onLoad 打恢复日志 ============
-    const loopFlagBefore = globalThis.__tsLoopStarted;
+    // ============ 11.5. 热重载模拟：状态保留、onLoad 重连 WS 并打恢复日志 ============
     delete require.cache[require.resolve(path)];
     require(path);
+    internals = globalThis.__TS_TEST__;
     const ext2 = exts['triangle_score_plugin'];
     check('reload reuses same ext (storage kept)', ext2 === ext, '');
     const stAfterReload = JSON.parse(ext.storageGet('ts_match_state') || 'null');
     check('reload keeps match state', !!stAfterReload && stAfterReload.matchId === 1 && stAfterReload.group === 'QQ-Group:1051905353', JSON.stringify(stAfterReload));
     check('reload keeps tokens', ext.storageGet('ts_match_token') === 'M' && ext.storageGet('ts_attacker_token') === 'A', '');
-    check('reload does not duplicate loop', globalThis.__tsLoopStarted === loopFlagBefore, String(loopFlagBefore));
     // 重新执行脚本会把 mock 配置重置为默认值，恢复测试用配置
     ext2.configs.siteUrl.val = 'http://site:8000';
     ext2.configs.controllerUrl.val = 'http://ctrl:8001';
     ext2.configs.screenshotUrl.val = 'http://shot:46799';
+    const wsBeforeReload = globalThis.__tsWsState.socket;
     let loadLog = '';
     const origLog = console.log;
     console.log = function (t) { loadLog += String(t); };
     ext2.onLoad();
     console.log = origLog;
-    check('onLoad logs resume info', loadLog.includes('检测到进行中对局') && loadLog.includes('轮询窗口'), loadLog);
+    await sleep(30);
+    check('onLoad logs resume info', loadLog.includes('检测到进行中对局') && loadLog.includes('控制器 WS'), loadLog);
+    check('onLoad keeps/restores WS connection', !!globalThis.__tsWsState.socket && globalThis.__tsWsState.socket.readyState === 1, '');
+    check('reload does not duplicate open WS', globalThis.__tsWsState.socket === wsBeforeReload, '');
 
     // ============ 12. stop：权限 + /api/end + 清秘钥 + 展示接下来的比赛 ============
     replies.length = 0; calls.length = 0;
@@ -313,7 +365,7 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('stop clears tokens when already ended', !ext.storageGet('ts_match_token') && !ext.storageGet('ts_defender_token') && !ext.storageGet('ts_attacker_token'), '');
     global.__END_ALREADY_OVER__ = false;
 
-    // ============ 12.5. 自动轮询结束：纯文本结果 + 展示接下来的比赛 ============
+    // ============ 12.5. WS 推送结束：纯文本结果 + 展示接下来的比赛 ============
     replies.length = 0; calls.length = 0;
     ext.storageSet('ts_match_state', JSON.stringify({
       group: 'QQ-Group:1051905353',
@@ -321,17 +373,25 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
       matchId: 1,
       roundId: 1,
       startedAt: Date.now() - 25 * 60 * 1000,
-      lastPollAt: 0,
       timeLimit: 25,
       attacker: { name: '阿晴', qqs: ['1001'] },
       defender: { name: '小澜', qqs: ['1002'] },
       players: {}
     }));
-    await sleep(2000);
-    check('auto end polls /api/tick', !!calls.find(c => c.url.includes('/api/tick')), calls.map(c => c.url).join(','));
-    check('auto end sends result text', !!replies.find(r => r.includes('比赛已结束') && r.includes('守护者获胜')), replies.join(' | '));
-    check('auto end shows upcoming matches text', !!replies.find(r => r.includes('【接下来的比赛】') && r.includes('局2') && r.includes('阿星')), replies.join(' | '));
-    check('auto end clears match state', !ext.storageGet('ts_match_state'), '');
+    ext.storageSet('ts_match_token', 'M');
+    ext.storageSet('ts_defender_token', 'D');
+    ext.storageSet('ts_attacker_token', 'A');
+    const wsSock = globalThis.__tsWsState.socket;
+    wsSock.receive(JSON.stringify({ type: 'state_update', game_over: false, elapsed: 1, time_limit: 25 }));
+    await sleep(30);
+    check('non-game_over update keeps state', !!ext.storageGet('ts_match_state'), '');
+    wsSock.receive(JSON.stringify({ type: 'state_update', game_over: true, winner: 'defender', win_type: 'timeout', elapsed: 25, time_limit: 25 }));
+    await sleep(150);
+    check('no /api/tick polling anymore', !calls.find(c => c.url.includes('/api/tick')), calls.map(c => c.url).join(','));
+    check('WS game_over sends result text', !!replies.find(r => r.includes('比赛已结束') && r.includes('守护者获胜')), replies.join(' | '));
+    check('WS game_over shows upcoming matches text', !!replies.find(r => r.includes('【接下来的比赛】') && r.includes('局2') && r.includes('阿星')), replies.join(' | '));
+    check('WS game_over clears match state', !ext.storageGet('ts_match_state'), '');
+    check('WS game_over clears tokens', !ext.storageGet('ts_match_token') && !ext.storageGet('ts_defender_token') && !ext.storageGet('ts_attacker_token'), '');
 
     // ============ 13. status：无对局 + 待审按群计数 ============
     replies.length = 0;
@@ -360,7 +420,6 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
   await sleep(150);
   check('both fail -> fallback text', !!replies.find(r => r.includes('网页截图失败')), replies.join(' | '));
   global.__MCP_FAIL__ = false;
-  globalThis.__TS_TEST_SUSPEND__ = true; // 暂停常驻循环，避免后台 tick 干扰后续状态类用例
 
   // ============ 15. 开局 QQ 缺失：警告但强制开局（不拦截） ============
   const backupSchedule = JSON.parse(JSON.stringify(SCHEDULE));
@@ -432,29 +491,44 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
   await sleep(150);
   check('own-group review still works', !pendingOf(pendKeys[0]) && !!replies.find(r => r.includes('成绩上报完成')), replies.join(' | '));
 
-  // ============ 17. 轮询失败告警：连续失败 3 次发提示，恢复后计数清零 ============
-  ext.storageSet('ts_match_state', JSON.stringify(Object.assign({}, st16, { startedAt: Date.now() - 25 * 60 * 1000, lastPollAt: 0 })));
-  ext.storageSet('ts_poll_fail', '');
-  replies.length = 0; calls.length = 0;
-  global.__TICK_FAIL__ = true;
-  const forcePoll = function () {
-    const m = JSON.parse(ext.storageGet('ts_match_state'));
-    m.lastPollAt = 0;
-    ext.storageSet('ts_match_state', JSON.stringify(m));
-    internals.tickPoll();
-  };
-  forcePoll(); forcePoll(); forcePoll();
-  await sleep(200); // 等异步 catch 完成
-  check('poll fail count reaches threshold and alerts', !!replies.find(r => r.includes('控制器状态轮询已连续失败 3 次')), replies.join(' | '));
-  const pf = JSON.parse(ext.storageGet('ts_poll_fail') || '{}');
-  check('poll fail state persisted', pf.count === 3 && pf.alerted === true, JSON.stringify(pf));
-  global.__TICK_FAIL__ = false;
-  global.__TICK_RECOVER__ = true; // 恢复轮询返回未结束，避免自动结束清掉状态
+  // ============ 17. WS 断线重连：ts reconnect + 失败计数/告警 + 恢复清零 ============
+  ext.storageSet('ts_match_state', JSON.stringify(Object.assign({}, st16, { startedAt: Date.now() })));
+  const st17 = globalThis.__tsWsState;
+  // 17a. .ts reconnect：丢弃旧连接并立即重连
+  const oldSock = st17.socket;
   replies.length = 0;
-  forcePoll();
-  await sleep(200); // 等恢复轮询的 then 链执行完
-  check('poll success clears fail state', !ext.storageGet('ts_poll_fail'), ext.storageGet('ts_poll_fail') || '');
-  check('recovery does not re-alert', !replies.find(r => r.includes('控制器状态轮询已连续失败')), replies.join(' | '));
+  ext.cmdMap['ts'].solve(ctx(60), msg('.ts reconnect'), args('reconnect'));
+  await sleep(30);
+  check('ts reconnect replies', !!replies[0] && replies[0].includes('正在重新连接控制器 WebSocket'), replies[0]);
+  check('ts reconnect creates fresh socket', !!st17.socket && st17.socket !== oldSock && st17.socket.readyState === 1, '');
+  check('ts reconnect resets retry', st17.retry === 0, 'retry=' + st17.retry);
+  // 17b. 断线：计数 + 状态显示断开 + 排自动重连
+  replies.length = 0;
+  st17.socket.fail();
+  await sleep(20);
+  check('ws fail increments retry and schedules reconnect', st17.retry === 1 && !!st17.timer, 'retry=' + st17.retry + ' timer=' + !!st17.timer);
+  check('ws status shows disconnected after fail', internals.wsStatusText().includes('断开（重试 1 次）'), internals.wsStatusText());
+  ext.cmdMap['ts'].solve(ctx(60), msg('.ts status'), args('status'));
+  check('status command shows WS disconnect', !!replies[0] && replies[0].includes('控制器 WS：断开（重试 1 次）'), replies[0].split('\n').find(l => l.includes('控制器 WS')));
+  // 17c. 连续失败 3 次向对局群告警（每次手动重建连接并立即失败）
+  global.__WS_FAIL__ = true;
+  for (let i = 0; i < 3; i++) {
+    if (st17.timer) { clearTimeout(st17.timer); st17.timer = null; }
+    internals.ensureControllerWs();
+    await sleep(30);
+  }
+  check('ws fail 3 times alerts group', !!replies.find(r => r.includes('控制器 WebSocket 已连续断开 3 次')), replies.join(' | '));
+  const wsAlerts = replies.filter(r => r.includes('控制器 WebSocket 已连续断开')).length;
+  check('ws alert sent once until recovery', wsAlerts === 1, 'alerts=' + wsAlerts);
+  // 17d. 恢复：__WS_FAIL__ 关闭后重连成功，计数清零且不再告警
+  global.__WS_FAIL__ = false;
+  if (st17.timer) { clearTimeout(st17.timer); st17.timer = null; }
+  replies.length = 0;
+  internals.ensureControllerWs();
+  await sleep(30);
+  check('ws recovers to connected', internals.wsStatusText() === '已连接', internals.wsStatusText());
+  check('ws retry reset after open', st17.retry === 0, 'retry=' + st17.retry);
+  check('recovery does not re-alert', !replies.find(r => r.includes('控制器 WebSocket 已连续断开')), replies.join(' | '));
 
   // ============ 18. stop 跨群：其他群调用 stop 不清本群 token，status 提示对局在别群 ============
   ext.storageSet('ts_match_state', JSON.stringify(Object.assign({}, st16, { startedAt: Date.now() })));
@@ -473,8 +547,6 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
   ext.storageSet('ts_match_token', '');
   ext.storageSet('ts_defender_token', '');
   ext.storageSet('ts_attacker_token', '');
-  global.__TICK_RECOVER__ = false;
-  globalThis.__TS_TEST_SUSPEND__ = false;
   } finally {
     const passed = results.filter(Boolean).length;
     console.log('\n' + passed + '/' + results.length + ' passed');
