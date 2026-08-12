@@ -44,7 +44,6 @@ const K_DEF = 'ts_defender_token';
 const K_ATK = 'ts_attacker_token';
 const K_PENDING = 'ts_pending';
 const K_COUNTDOWN = 'ts_countdown';       // 倒计时任务（0.5s 循环从存储读取，重载不丢）
-const K_SELECT = 'ts_select';             // 等待管理回复对局 ID 的候选列表
 const K_MATCH_STATE = 'ts_match_state';   // 当前进行中对局（身份/开局时间）
 
 function getStoredToken(key) {
@@ -71,9 +70,6 @@ function savePending(p) { saveJson(K_PENDING, p); }
 function loadCountdown() { return loadJson(K_COUNTDOWN, null); }
 function saveCountdown(cd) { saveJson(K_COUNTDOWN, cd); }
 function clearCountdown() { ext.storageSet(K_COUNTDOWN, ''); }
-function loadSelect() { return loadJson(K_SELECT, null); }
-function saveSelect(s) { saveJson(K_SELECT, s); }
-function clearSelect() { ext.storageSet(K_SELECT, ''); }
 function loadMatchState() { return loadJson(K_MATCH_STATE, null); }
 function saveMatchState(st) { saveJson(K_MATCH_STATE, st); }
 function clearMatchState() { ext.storageSet(K_MATCH_STATE, ''); }
@@ -474,7 +470,7 @@ function beginCountdown(ctx, msg, match, competition) {
     return '[CQ:at,qq=' + q + ']';
   }).join(' ');
   const text = ats +
-    '\n【三角占领】第 ' + match.round_id + ' 轮：掠夺者「' + sides.attacker.name + '」 vs 守护者「' + sides.defender.name + '」' +
+    '\n【三角占领】第 ' + match.round_id + ' 轮（对局ID ' + match.id + '）：掠夺者「' + sides.attacker.name + '」 vs 守护者「' + sides.defender.name + '」' +
     '\n2 分钟后开局，请双方做好准备！';
   seal.replyToSender(ctx, msg, text);
   saveCountdown({
@@ -603,10 +599,7 @@ function tickPoll() {
 }
 
 function tickCleanup() {
-  const now = Date.now();
-  const sel = loadSelect();
-  if (sel && now - (sel.ts || 0) > 180000) clearSelect();
-  cleanupPending(now);
+  cleanupPending(Date.now());
 }
 
 function tickLoop() {
@@ -975,7 +968,7 @@ cmd.name = 'ts';
 cmd.help = [
   '.ts help                    查看帮助',
   '.ts status                  查看配置 / 倒计时 / 当前对局状态',
-  '.ts start                   拉取赛程 → 选择对局 → @选手倒计时开局（仅群管理以上）',
+  '.ts start [对局ID]          拉取赛程 → 展示候选；带 ID 直接选择开局（仅群管理以上）',
   '.ts stop                    结束比赛并展示接下来的比赛（仅群管理以上）',
   '.ts board                   查看控制器当前比分/占领情况',
   '.ts tasks                   查看本局 21 个任务格的歌曲列表',
@@ -983,7 +976,7 @@ cmd.help = [
   '',
   '【开局流程】',
   '1. 群管理发送 .ts start，bot 列出候选对局（含双方与 QQ）；',
-  '2. 群管理回复对局 ID（纯数字）确认；',
+  '2. 群管理发送 .ts start <对局ID> 选择要开始的比赛（例：.ts start 13）；',
   '3. bot @ 全体选手并开始 2 分钟倒计时（剩余 1 分钟时提醒一次，最后 3 秒读秒）；',
   '4. 倒计时结束自动开局并记录秘钥，发棋盘截图。',
   '',
@@ -1068,6 +1061,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       seal.replyToSender(ctx, msg, '未配置 siteUrl（插件设置），无法拉取赛程');
       return ret;
     }
+    const startId = String(cmdArgs.getArgN(2) || '').trim();
     seal.replyToSender(ctx, msg, '正在拉取赛程…');
     fetchSchedule().then(function (s) {
       const candidates = (s.matches || []).filter(function (m) {
@@ -1080,8 +1074,18 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       const lines = candidates.map(function (m) {
         return '对局ID ' + m.id + ' ｜ 第' + m.round_id + '轮：掠夺者 ' + sideText(m.participant_a) + ' vs 守护者 ' + sideText(m.participant_b);
       });
-      saveSelect({ group: gid, competition: s.competition, candidates: candidates, ts: Date.now() });
-      seal.replyToSender(ctx, msg, '请群管理回复对局 ID（纯数字）确认要开始的比赛（120 秒内有效）：\n' + lines.join('\n'));
+      if (startId) {
+        const match = candidates.find(function (c) {
+          return String(c.id) === startId;
+        });
+        if (!match) {
+          seal.replyToSender(ctx, msg, '没有找到对局 ID=' + startId + ' 的待开始对局（可重新 .ts start 查看最新赛程）：\n' + lines.join('\n'));
+          return;
+        }
+        beginCountdown(ctx, msg, match, s.competition);
+        return;
+      }
+      seal.replyToSender(ctx, msg, '请群管理发送 .ts start <对局ID> 开始该场比赛（例：.ts start ' + candidates[0].id + '）：\n' + lines.join('\n'));
     }).catch(function (e) {
       seal.replyToSender(ctx, msg, '拉取赛程失败：' + (e && e.message ? e.message : e) + '（请确认 siteUrl 与比赛网站状态）');
     });
@@ -1188,10 +1192,8 @@ ext.onLoad = function () {
   }
 };
 
-// 引用截图 + 触发文本（[CQ:reply] 前缀的消息不视为指令，走非指令钩子）；
-// 另外处理 .ts start 之后管理回复「对局 ID」的选择。
+// 引用截图 + 触发文本（[CQ:reply] 前缀的消息不视为指令，走非指令钩子）。
 ext.onNotCommandReceived = function (ctx, msg) {
-  const gid = gidOf(msg);
   const raw = String(msg.message || '');
   const parsed = parseReplyPrefix(raw);
 
@@ -1207,21 +1209,6 @@ ext.onNotCommandReceived = function (ctx, msg) {
     if (!regex || !regex.test(rest)) return;
     handleUpload(ctx, msg, parsed.replyId);
     return;
-  }
-
-  // .ts start 后等待管理回复对局 ID（纯数字）
-  const sel = loadSelect();
-  const trimmed = raw.trim();
-  if (sel && String(sel.group) === gid && isAdmin(ctx) && /^\d+$/.test(trimmed)) {
-    const match = (sel.candidates || []).find(function (c) {
-      return String(c.id) === trimmed;
-    });
-    if (match) {
-      clearSelect();
-      beginCountdown(ctx, msg, match, sel.competition);
-      return;
-    }
-    seal.replyToSender(ctx, msg, '没有找到对局 ID=' + trimmed + ' 的候选对局（可重新 .ts start 查看最新赛程）');
   }
 };
 

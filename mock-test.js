@@ -143,22 +143,30 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     await sleep(150);
     check('start pulls schedule', !!calls.find(c => c.url.includes('/api/schedule/current')), calls.map(c => c.url).join(','));
     check('candidate list shown', !!replies.find(r => r.includes('对局ID 1') && r.includes('阿晴') && r.includes('小澜') && r.includes('QQ:1001')), replies.join(' | '));
-    check('selection stored', !!JSON.parse(ext.storageGet('ts_select')), '');
+    check('no select state stored (arg-based flow)', !ext.storageGet('ts_select'), '');
 
-    // ============ 3. 非管理回复数字：不生效 ============
+    // ============ 3. 纯数字消息不再触发选择（选择已改为 .ts start <ID>） ============
     ext.storageSet('ts_countdown', '');
     replies.length = 0;
-    ext.onNotCommandReceived(ctx(0), msg('1'));
-    check('non-admin digit ignored', ext.storageGet('ts_countdown') === '', replies.join(' | '));
-
-    // ============ 4. 管理回复对局 ID：开始倒计时 ============
-    replies.length = 0;
     ext.onNotCommandReceived(ctx(60), msg('1'));
+    check('plain digit no longer selects', ext.storageGet('ts_countdown') === '', replies.join(' | '));
+
+    // ============ 4. 管理 .ts start 1：直接开始倒计时 ============
+    ext.storageSet('ts_countdown', '');
+    replies.length = 0;
+    ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 1'), args('start', '1'));
     await sleep(150);
     const cd = JSON.parse(ext.storageGet('ts_countdown'));
     check('countdown task stored', !!cd && cd.matchId === 1 && cd.group === 'QQ-Group:1051905353', JSON.stringify(cd));
-    check('countdown reply with @ + 2min', !!replies.find(r => r.includes('[CQ:at,qq=1001]') && r.includes('[CQ:at,qq=1002]') && r.includes('2 分钟后开局')), replies.join(' | '));
-    check('selection cleared after pick', !ext.storageGet('ts_select'), '');
+    check('countdown reply with @ + 2min', !!replies.find(r => r.includes('[CQ:at,qq=1001]') && r.includes('[CQ:at,qq=1002]') && r.includes('2 分钟后开局') && r.includes('对局ID 1')), replies.join(' | '));
+
+    // ============ 4b. 无效 ID：不开局，列出候选 ============
+    ext.storageSet('ts_countdown', '');
+    replies.length = 0;
+    ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 999'), args('start', '999'));
+    await sleep(150);
+    check('invalid id rejected with candidates', !!replies.find(r => r.includes('没有找到对局 ID=999') && r.includes('对局ID 1')), replies.join(' | '));
+    check('no countdown for invalid id', !ext.storageGet('ts_countdown'), '');
 
     // ============ 5. 跨群互斥：其他群已有倒计时 → 本群 start 被拒 ============
     replies.length = 0;
