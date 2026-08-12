@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         triangle-score-plugin
 // @author       错误
-// @version      2.0.1
+// @version      2.0.2
 // @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 结束展示接下来的比赛
 // @timestamp    2026-08-12
 // @license      MIT
@@ -18,7 +18,7 @@
 // ============ 1. 创建 / 复用扩展 ============
 let ext = seal.ext.find('triangle_score_plugin');
 if (!ext) {
-  ext = seal.ext.new('triangle_score_plugin', '错误', '2.0.1');
+  ext = seal.ext.new('triangle_score_plugin', '错误', '2.0.2');
   seal.ext.register(ext);
 }
 
@@ -307,7 +307,7 @@ async function mcpScreenshot(base, targetUrl, token) {
         params: {
           protocolVersion: '2026-03-26',
           capabilities: {},
-          clientInfo: { name: 'triangle-score-plugin', version: '2.0.1' }
+          clientInfo: { name: 'triangle-score-plugin', version: '2.0.2' }
         }
       })
     }), 20000);
@@ -1187,7 +1187,22 @@ ext.cmdMap['三角'] = cmd;
 
 // ============ 13. 事件钩子 ============
 ext.onLoad = function () {
-  console.log('[' + ext.name + '] v' + ext.version + ' 已加载');
+  const st = loadMatchState();
+  const pendings = loadPending();
+  const pendingCount = Object.keys(pendings).filter(function (k) {
+    return String(pendings[k].group || '');
+  }).length;
+  if (st && st.group) {
+    const now = Date.now();
+    const pollStartMs = Math.max(0, (st.timeLimit || DEFAULT_TIME_LIMIT) * 60 * 1000 - 60000);
+    const remainSec = Math.max(0, Math.ceil(((st.startedAt || now) + pollStartMs - now) / 1000));
+    console.log('[' + ext.name + '] v' + ext.version + ' 已加载：检测到进行中对局（第 ' + st.roundId + ' 轮，已进行 ' +
+      Math.floor((now - (st.startedAt || now)) / 60000) + ' 分钟，' +
+      (remainSec > 0 ? '约 ' + Math.ceil(remainSec / 60) + ' 分钟后进入轮询窗口' : '已进入轮询窗口，恢复轮询') +
+      '）' + (pendingCount ? '，待审成绩 ' + pendingCount + ' 条' : '，无待审成绩') + '。热重载不影响比赛继续');
+  } else {
+    console.log('[' + ext.name + '] v' + ext.version + ' 已加载（无进行中对局）' + (pendingCount ? '，待审成绩 ' + pendingCount + ' 条' : ''));
+  }
 };
 
 // 引用截图 + 触发文本（[CQ:reply] 前缀的消息不视为指令，走非指令钩子）。

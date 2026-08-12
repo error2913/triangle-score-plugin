@@ -253,6 +253,27 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('retry confirm succeeds', !!calls.find(c => c.url.includes('/api/v1/results')), '');
     check('pending cleared after success', !pendingOf('557'), '');
 
+    // ============ 11.5. 热重载模拟：状态保留、循环不重复、onLoad 打恢复日志 ============
+    const loopFlagBefore = globalThis.__tsLoopStarted;
+    delete require.cache[require.resolve(path)];
+    require(path);
+    const ext2 = exts['triangle_score_plugin'];
+    check('reload reuses same ext (storage kept)', ext2 === ext, '');
+    const stAfterReload = JSON.parse(ext.storageGet('ts_match_state') || 'null');
+    check('reload keeps match state', !!stAfterReload && stAfterReload.matchId === 1 && stAfterReload.group === 'QQ-Group:1051905353', JSON.stringify(stAfterReload));
+    check('reload keeps tokens', ext.storageGet('ts_match_token') === 'M' && ext.storageGet('ts_attacker_token') === 'A', '');
+    check('reload does not duplicate loop', globalThis.__tsLoopStarted === loopFlagBefore, String(loopFlagBefore));
+    // 重新执行脚本会把 mock 配置重置为默认值，恢复测试用配置
+    ext2.configs.siteUrl.val = 'http://site:8000';
+    ext2.configs.controllerUrl.val = 'http://ctrl:8001';
+    ext2.configs.screenshotUrl.val = 'http://shot:46799';
+    let loadLog = '';
+    const origLog = console.log;
+    console.log = function (t) { loadLog += String(t); };
+    ext2.onLoad();
+    console.log = origLog;
+    check('onLoad logs resume info', loadLog.includes('检测到进行中对局') && loadLog.includes('轮询窗口'), loadLog);
+
     // ============ 12. stop：权限 + /api/end + 清秘钥 + 展示接下来的比赛 ============
     replies.length = 0; calls.length = 0;
     ext.cmdMap['ts'].solve(ctx(0), msg('.ts stop'), args('stop'));
