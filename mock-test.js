@@ -65,7 +65,10 @@ global.fetch = function (url, opts) {
   const u = String(url);
   const bodyObj = opts && opts.body ? JSON.parse(opts.body) : null;
   if (u.includes('/api/init')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, tokens: { match: 'M', defender: 'D', attacker: 'A' }, state: {} }) });
-  if (u.includes('/api/end')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
+  if (u.includes('/api/end')) {
+    if (global.__END_ALREADY_OVER__) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: false, state: { started: true, game_over: true, winner: 'draw', win_type: 'timeout' } }) });
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) });
+  }
   if (u.includes('/api/tick')) {
     if (global.__TICK_FAIL__) return Promise.reject(new Error('mock: controller unreachable'));
     return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(global.__TICK_RECOVER__ ? { elapsed: 25, time_limit: 25, game_over: false } : { elapsed: 25, time_limit: 25, game_over: true }) });
@@ -292,6 +295,24 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('stop sends no bracket screenshot', noBracketShot, calls.filter(c => c.url.includes('/mcp')).map(c => { try { return JSON.parse(c.opts.body).params.arguments.url; } catch (e) { return ''; } }).join(','));
     check('stop shows upcoming matches text', !!replies.find(r => r.includes('【接下来的比赛】') && r.includes('局2') && r.includes('阿星') && r.includes('柚子')), replies.join(' | '));
 
+    // ============ 12b. stop：控制器已超时结束（HTTP 200 + ok:false + game_over）→ 仍正常清理 ============
+    global.__END_ALREADY_OVER__ = true;
+    ext.storageSet('ts_match_state', JSON.stringify({
+      group: 'QQ-Group:1051905353', competitionId: 1, matchId: 1, roundId: 1,
+      startedAt: Date.now() - 30 * 60 * 1000, lastPollAt: 0, timeLimit: 25,
+      attacker: { name: '阿晴', qqs: ['1001'] }, defender: { name: '小澜', qqs: ['1002'] }, players: {}
+    }));
+    ext.storageSet('ts_match_token', 'M');
+    ext.storageSet('ts_defender_token', 'D');
+    ext.storageSet('ts_attacker_token', 'A');
+    replies.length = 0; calls.length = 0;
+    ext.cmdMap['ts'].solve(ctx(60), msg('.ts stop'), args('stop'));
+    await sleep(150);
+    check('stop treats game_over ok:false as ended', !!replies.find(r => r.includes('比赛已结束（控制器此前已判定结束）')), replies.join(' | '));
+    check('stop clears state when already ended', !ext.storageGet('ts_match_state'), '');
+    check('stop clears tokens when already ended', !ext.storageGet('ts_match_token') && !ext.storageGet('ts_defender_token') && !ext.storageGet('ts_attacker_token'), '');
+    global.__END_ALREADY_OVER__ = false;
+
     // ============ 12.5. 自动轮询结束：纯文本结果 + 展示接下来的比赛 ============
     replies.length = 0; calls.length = 0;
     ext.storageSet('ts_match_state', JSON.stringify({
@@ -341,24 +362,32 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
   global.__MCP_FAIL__ = false;
   globalThis.__TS_TEST_SUSPEND__ = true; // 暂停常驻循环，避免后台 tick 干扰后续状态类用例
 
-  // ============ 15. 开局前拦截：双方均未填 QQ 不得开局 ============
+  // ============ 15. 开局 QQ 缺失：警告但强制开局（不拦截） ============
   const backupSchedule = JSON.parse(JSON.stringify(SCHEDULE));
   SCHEDULE.matches[0].participant_a.qqs = [];
   SCHEDULE.matches[0].participant_b.qqs = [];
   ext.storageSet('ts_match_state', '');
   ext.storageSet('ts_match_token', '');
+  ext.storageSet('ts_defender_token', '');
+  ext.storageSet('ts_attacker_token', '');
   replies.length = 0; calls.length = 0;
   ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 1'), args('start', '1'));
-  await sleep(150);
-  check('start blocked when both sides lack QQ', !!replies.find(r => r.includes('开局失败：双方选手均未在网站个人资料中填写 QQ')), replies.join(' | '));
-  check('blocked start does not init', !calls.find(c => c.url.includes('/api/init')), '');
-  // 仅一侧缺 QQ：警告但允许继续
+  await sleep(300);
+  check('both sides lack QQ warns but starts', !!replies.find(r => r.includes('开局警告') && r.includes('阿晴') && r.includes('小澜')), replies.join(' | '));
+  check('both sides lack QQ still calls init', !!calls.find(c => c.url.includes('/api/init')), '');
+  check('no @ when both sides lack QQ', !replies.find(r => r.includes('[CQ:at,qq=')), replies.join(' | '));
+  // 仅一侧缺 QQ：警告但继续，@ 只发给已填 QQ 一侧
   SCHEDULE.matches[0].participant_b.qqs = ['1002'];
+  ext.storageSet('ts_match_state', '');
+  ext.storageSet('ts_match_token', '');
+  ext.storageSet('ts_defender_token', '');
+  ext.storageSet('ts_attacker_token', '');
   replies.length = 0; calls.length = 0;
   ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 1'), args('start', '1'));
-  await sleep(150);
+  await sleep(300);
   check('one-side missing QQ warns but continues', !!replies.find(r => r.includes('开局警告：掠夺者「阿晴」 未填写 QQ')), replies.join(' | '));
   check('warn path still calls init', !!calls.find(c => c.url.includes('/api/init')), '');
+  check('one-side warns @s known side only', !!replies.find(r => r.includes('[CQ:at,qq=1002]') && !r.includes('[CQ:at,qq=1001]')), replies.join(' | '));
   SCHEDULE.matches = JSON.parse(JSON.stringify(backupSchedule.matches));
   ext.storageSet('ts_match_state', ''); // 清掉警告路径开的局
   ext.storageSet('ts_match_token', '');

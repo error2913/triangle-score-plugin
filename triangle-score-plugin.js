@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         triangle-score-plugin
 // @author       错误
-// @version      2.0.2
+// @version      2.0.3
 // @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 结束展示接下来的比赛
 // @timestamp    2026-08-12
 // @license      MIT
@@ -433,6 +433,7 @@ function scheduleUrl() {
 async function fetchSchedule() {
   const url = scheduleUrl();
   if (!url) throw new Error('未配置 siteUrl（插件设置）');
+  debugLog('拉取赛程：GET ' + url);
   const resp = await withTimeout(fetch(url), 30000);
   let body = null;
   try {
@@ -440,6 +441,7 @@ async function fetchSchedule() {
   } catch (e) {
     body = null;
   }
+  debugLog('赛程响应：HTTP ' + resp.status + ' 响应体=' + (body ? JSON.stringify(body).slice(0, 300) : '无'));
   if (resp.status >= 400 || !body || !body.competition || !Array.isArray(body.matches)) {
     const message = body && body.detail ? body.detail : 'HTTP ' + resp.status;
     throw new Error(message);
@@ -522,9 +524,10 @@ async function startMatchCore(info, ctx, msg) {
     } catch (e) {
       body = null;
     }
+    debugLog('开局接口响应：HTTP ' + resp.status + ' 响应体=' + (body ? JSON.stringify(body).slice(0, 300) : '无'));
     if (resp.status >= 400 || !body || !body.ok) {
-      const message = body && body.message ? body.message : 'HTTP ' + resp.status;
-      say('开局失败：' + message + '（若提示请先导入歌曲库，需由后端运行人先 POST /api/songs；可重新 .ts start）');
+      const detail = body ? (body.message || body.detail || JSON.stringify(body).slice(0, 150)) : '';
+      say('开局失败：' + (detail || 'HTTP ' + resp.status) + '（若提示请先导入歌曲库，需由后端运行人先 POST /api/songs；可重新 .ts start）');
       return;
     }
     const t = body.tokens || {};
@@ -696,6 +699,7 @@ async function stopMatchAsync(ctx, msg) {
   seal.replyToSender(ctx, msg, '正在结束比赛…');
   const st = loadMatchState();
   try {
+    debugLog('停止比赛：POST ' + base + '/api/end（matchId=' + (st ? st.matchId : '无本地状态') + '）');
     const resp = await withTimeout(fetch(base + '/api/end', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -707,9 +711,11 @@ async function stopMatchAsync(ctx, msg) {
     } catch (e) {
       body = null;
     }
-    if (resp.status >= 400 || !body || !body.ok) {
-      const message = body && body.message ? body.message : 'HTTP ' + resp.status;
-      seal.replyToSender(ctx, msg, '结束比赛失败：' + message);
+    debugLog('停止比赛响应：HTTP ' + resp.status + ' 响应体=' + (body ? JSON.stringify(body).slice(0, 300) : '无'));
+    const alreadyEnded = !!(body && body.state && body.state.game_over === true);
+    if (resp.status >= 400 || !body || (!body.ok && !alreadyEnded)) {
+      const detail = body ? (body.message || body.detail || JSON.stringify(body).slice(0, 150)) : '';
+      seal.replyToSender(ctx, msg, '结束比赛失败：' + (detail || 'HTTP ' + resp.status));
       return;
     }
     const pendings = loadPending();
@@ -727,11 +733,12 @@ async function stopMatchAsync(ctx, msg) {
       clearTokens();
       clearPollFail();
     }
-    seal.replyToSender(ctx, msg, '比赛已结束，待审成绩已清空');
+    seal.replyToSender(ctx, msg, alreadyEnded ? '比赛已结束（控制器此前已判定结束），待审成绩已清空' : '比赛已结束，待审成绩已清空');
     await sendUpcomingMatchesAsync(gid, st ? st.matchId : null, function (t) {
       seal.replyToSender(ctx, msg, t);
     });
   } catch (e) {
+    debugLog('停止比赛异常：' + (e && e.message ? e.message : e));
     seal.replyToSender(ctx, msg, '结束比赛失败（网络/接口）：' + (e && e.message ? e.message : e));
   }
 }
@@ -1016,7 +1023,8 @@ cmd.help = [
   '【开局流程】',
   '1. 群管理发送 .ts start，bot 列出候选对局（含双方与 QQ）；',
   '2. 群管理发送 .ts start <对局ID> 选择要开始的比赛（例：.ts start 13）；',
-  '3. bot @ 全体选手并直接开局（POST /api/init 自动记录秘钥，不对外展示），发棋盘截图。',
+  '3. bot @ 已填 QQ 的选手并直接开局（POST /api/init 自动记录秘钥，不对外展示），发棋盘截图；',
+  '   未填 QQ 的一侧会收到警告，仍可强制开局，但该侧结算截图无法自动匹配身份上传。',
   '',
   '【上传成绩流程】',
   '1. 引用（回复）一张结算截图，消息文本填「上传成绩」；',
@@ -1094,6 +1102,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       const candidates = (s.matches || []).filter(function (m) {
         return m.status === 'pending' && m.participant_a && m.participant_b;
       });
+      debugLog('赛程解析：比赛ID=' + (s.competition && s.competition.id) + ' 待开局候选=' + candidates.length + ' 场（startId=' + (startId || '未指定') + '）');
       if (candidates.length === 0) {
         seal.replyToSender(ctx, msg, '当前没有双方已确定的待开始对局（单败淘汰后续轮次需上一轮结束后才能排定）');
         return;
@@ -1113,18 +1122,15 @@ cmd.solve = function (ctx, msg, cmdArgs) {
         const missingQq = [];
         if (!sides.attacker.qqs.length) missingQq.push('掠夺者「' + sides.attacker.name + '」');
         if (!sides.defender.qqs.length) missingQq.push('守护者「' + sides.defender.name + '」');
-        if (!sides.attacker.qqs.length && !sides.defender.qqs.length) {
-          seal.replyToSender(ctx, msg, '开局失败：双方选手均未在网站个人资料中填写 QQ。请选手登录比赛网站填写 QQ 后再发送 .ts start <对局ID> 开局。');
-          return;
-        }
         if (missingQq.length) {
-          seal.replyToSender(ctx, msg, '开局警告：' + missingQq.join('、') + ' 未填写 QQ，该侧选手将无法上传成绩。建议填写后再开局，仍要继续请再次发送 .ts start <对局ID>。');
+          debugLog('对局ID=' + match.id + ' 强制开局（QQ 缺失：' + missingQq.join('、') + '）');
+          seal.replyToSender(ctx, msg, '开局警告：' + missingQq.join('、') + ' 未填写 QQ，该侧选手不会被 @，结算截图也无法自动匹配身份上传。若选手后续补填 QQ 可重新开局；本次仍继续。');
         }
         const ats = sides.attacker.qqs.concat(sides.defender.qqs).map(function (q) {
           return '[CQ:at,qq=' + q + ']';
         }).join(' ');
-        seal.replyToSender(ctx, msg, ats +
-          '\n【三角占领】第 ' + match.round_id + ' 轮（对局ID ' + match.id + '）：掠夺者「' + sides.attacker.name + '」 vs 守护者「' + sides.defender.name + '」' +
+        seal.replyToSender(ctx, msg, (ats ? ats + '\n' : '') +
+          '【三角占领】第 ' + match.round_id + ' 轮（对局ID ' + match.id + '）：掠夺者「' + sides.attacker.name + '」 vs 守护者「' + sides.defender.name + '」' +
           '\n正在开局…');
         startMatchCore({
           group: gid,
@@ -1140,6 +1146,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       }
       seal.replyToSender(ctx, msg, '请群管理发送 .ts start <对局ID> 开始该场比赛（例：.ts start ' + candidates[0].id + '）：\n' + lines.join('\n'));
     }).catch(function (e) {
+      debugLog('拉取赛程失败：' + (e && e.message ? e.message : e));
       seal.replyToSender(ctx, msg, '拉取赛程失败：' + (e && e.message ? e.message : e) + '（请确认 siteUrl 与比赛网站状态）');
     });
     return ret;
