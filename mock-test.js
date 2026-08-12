@@ -146,46 +146,42 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     check('no select state stored (arg-based flow)', !ext.storageGet('ts_select'), '');
 
     // ============ 3. 纯数字消息不再触发选择（选择已改为 .ts start <ID>） ============
-    ext.storageSet('ts_countdown', '');
-    replies.length = 0;
+    replies.length = 0; calls.length = 0;
     ext.onNotCommandReceived(ctx(60), msg('1'));
-    check('plain digit no longer selects', ext.storageGet('ts_countdown') === '', replies.join(' | '));
+    await sleep(50);
+    check('plain digit does nothing', replies.length === 0 && !calls.find(c => c.url.includes('/api/init')), replies.join(' | '));
 
-    // ============ 4. 管理 .ts start 1：直接开始倒计时 ============
-    ext.storageSet('ts_countdown', '');
-    replies.length = 0;
+    // ============ 4. 管理 .ts start 1：直接开局 ============
+    ext.storageSet('ts_match_state', '');
+    ext.storageSet('ts_match_token', '');
+    ext.storageSet('ts_defender_token', '');
+    ext.storageSet('ts_attacker_token', '');
+    replies.length = 0; calls.length = 0;
     ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 1'), args('start', '1'));
-    await sleep(150);
-    const cd = JSON.parse(ext.storageGet('ts_countdown'));
-    check('countdown task stored', !!cd && cd.matchId === 1 && cd.group === 'QQ-Group:1051905353', JSON.stringify(cd));
-    check('countdown reply with @ + 2min', !!replies.find(r => r.includes('[CQ:at,qq=1001]') && r.includes('[CQ:at,qq=1002]') && r.includes('2 分钟后开局') && r.includes('对局ID 1')), replies.join(' | '));
-
-    // ============ 4b. 无效 ID：不开局，列出候选 ============
-    ext.storageSet('ts_countdown', '');
-    replies.length = 0;
-    ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 999'), args('start', '999'));
-    await sleep(150);
-    check('invalid id rejected with candidates', !!replies.find(r => r.includes('没有找到对局 ID=999') && r.includes('对局ID 1')), replies.join(' | '));
-    check('no countdown for invalid id', !ext.storageGet('ts_countdown'), '');
-
-    // ============ 5. 跨群互斥：其他群已有倒计时 → 本群 start 被拒 ============
-    replies.length = 0;
-    ext.storageSet('ts_countdown', JSON.stringify({ group: 'QQ-Group:888', endAt: Date.now() + 600000, roundId: 1 }));
-    ext.cmdMap['ts'].solve(ctx(60), msg('.ts start'), args('start'));
-    check('cross-group countdown blocks start', !!replies.find(r => r.includes('另一个群已有倒计时')), replies.join(' | '));
-    ext.storageSet('ts_countdown', JSON.stringify(cd)); // 恢复本群倒计时
-
-    // ============ 6. 快进倒计时：3/2/1 → 开局 → 棋盘截图 ============
-    cd.endAt = Date.now() + 3500;
-    ext.storageSet('ts_countdown', JSON.stringify(cd));
-    await sleep(6500);
-    check('countdown 3,2,1 sent via endpoint iteration', !!replies.find(r => r === '3') && !!replies.find(r => r === '2') && !!replies.find(r => r === '1'), replies.filter(r => ['3', '2', '1'].includes(r)).join(','));
-    check('init called after countdown', !!calls.find(c => c.url.includes('/api/init')), '');
-    check('match tokens stored', ext.storageGet('ts_match_token') === 'M', '');
+    await sleep(300);
+    check('start announcement with @', !!replies.find(r => r.includes('[CQ:at,qq=1001]') && r.includes('[CQ:at,qq=1002]') && r.includes('正在开局…') && r.includes('对局ID 1')), replies.join(' | '));
+    check('init called directly', !!calls.find(c => c.url.includes('/api/init')), '');
+    check('match tokens stored', ext.storageGet('ts_match_token') === 'M' && ext.storageGet('ts_defender_token') === 'D' && ext.storageGet('ts_attacker_token') === 'A', '');
     const st = JSON.parse(ext.storageGet('ts_match_state'));
     check('match state stored (identity)', !!st && st.matchId === 1 && !st.bracketUrl && !!st.players['1001'], JSON.stringify(st));
     check('started reply + board shot', !!replies.find(r => r.includes('比赛已开始')) && !!replies.find(r => r.startsWith('[CQ:image,file=base64://')), '');
-    check('countdown cleared after start', !ext.storageGet('ts_countdown'), '');
+    check('no countdown storage', !ext.storageGet('ts_countdown'), '');
+
+    // ============ 4b. 无效 ID：不开局，列出候选 ============
+    ext.storageSet('ts_match_state', '');
+    replies.length = 0; calls.length = 0;
+    ext.cmdMap['ts'].solve(ctx(60), msg('.ts start 999'), args('start', '999'));
+    await sleep(150);
+    check('invalid id rejected with candidates', !!replies.find(r => r.includes('没有找到对局 ID=999') && r.includes('对局ID 1')), replies.join(' | '));
+    check('invalid id does not start', !ext.storageGet('ts_match_state') && !calls.find(c => c.url.includes('/api/init')), '');
+    ext.storageSet('ts_match_state', JSON.stringify(st)); // 恢复第 4 节的对局状态供后续测试
+
+    // ============ 5. 跨群互斥：其他群已有对局 → 本群 start 被拒 ============
+    replies.length = 0;
+    ext.storageSet('ts_match_state', JSON.stringify({ group: 'QQ-Group:888', matchId: 9, roundId: 1 }));
+    ext.cmdMap['ts'].solve(ctx(60), msg('.ts start'), args('start'));
+    check('cross-group match blocks start', !!replies.find(r => r.includes('另一个群已有对局进行中')), replies.join(' | '));
+    ext.storageSet('ts_match_state', JSON.stringify(st)); // 恢复本群对局
 
     // ============ 7. status：当前对局 ============
     replies.length = 0;
@@ -291,7 +287,7 @@ const pendingOf = (k) => { const p = JSON.parse(ext.storageGet('ts_pending') || 
     // ============ 13. status：无对局 + 待审按群计数 ============
     replies.length = 0;
     ext.cmdMap['ts'].solve(ctx(60), msg('.ts status'), args('status'));
-    check('status shows no match', replies[0].includes('无倒计时/对局'), replies[0].split('\n')[0]);
+    check('status shows no match', replies[0].includes('无进行中对局'), replies[0].split('\n')[0]);
     ext.storageSet('ts_pending', JSON.stringify({
       aaa: { group: 'QQ-Group:999', ts: Date.now(), code: 'A' },
       bbb: { group: 'QQ-Group:1051905353', ts: Date.now(), code: 'B' }

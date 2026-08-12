@@ -2,7 +2,7 @@
 // @name         triangle-score-plugin
 // @author       错误
 // @version      2.0.0
-// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手倒计时开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 结束展示接下来的比赛
+// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 结束展示接下来的比赛
 // @timestamp    2026-08-10
 // @license      MIT
 // @homepageURL  https://github.com/error2913/triangle-score-plugin
@@ -43,7 +43,6 @@ const K_MATCH = 'ts_match_token';
 const K_DEF = 'ts_defender_token';
 const K_ATK = 'ts_attacker_token';
 const K_PENDING = 'ts_pending';
-const K_COUNTDOWN = 'ts_countdown';       // 倒计时任务（0.5s 循环从存储读取，重载不丢）
 const K_MATCH_STATE = 'ts_match_state';   // 当前进行中对局（身份/开局时间）
 
 function getStoredToken(key) {
@@ -67,9 +66,6 @@ function saveJson(key, obj) {
 
 function loadPending() { return loadJson(K_PENDING, {}); }
 function savePending(p) { saveJson(K_PENDING, p); }
-function loadCountdown() { return loadJson(K_COUNTDOWN, null); }
-function saveCountdown(cd) { saveJson(K_COUNTDOWN, cd); }
-function clearCountdown() { ext.storageSet(K_COUNTDOWN, ''); }
 function loadMatchState() { return loadJson(K_MATCH_STATE, null); }
 function saveMatchState(st) { saveJson(K_MATCH_STATE, st); }
 function clearMatchState() { ext.storageSet(K_MATCH_STATE, ''); }
@@ -174,7 +170,7 @@ function qqNumberFromUserId(userId) {
   return m ? m[1] : '';
 }
 
-// ============ 5. 主动发群消息（倒计时/轮询回调里没有原始 ctx） ============
+// ============ 5. 主动发群消息（轮询回调里没有原始 ctx） ============
 function sendToGroup(gid, text) {
   const eps = seal.getEndPoints();
   if (!eps || !eps.length) {
@@ -360,7 +356,7 @@ async function takeBoardScreenshot(ctx, msg, fallbackText) {
   return takeScreenshotFor(ctx, msg, ctrlBase, fallbackText);
 }
 
-// 无原始 ctx（倒计时/轮询回调）时给群发截图
+// 无原始 ctx（轮询回调）时给群发截图
 async function sendScreenshotToGroup(gid, url, fallbackText) {
   const base = getCfg('screenshotUrl').replace(/\/+$/, '');
   if (!base) {
@@ -458,71 +454,21 @@ async function sendUpcomingMatchesAsync(gid, excludeMatchId, emit) {
   else sendToGroup(gid, text);
 }
 
-// ============ 9. 倒计时 / 结束轮询（0.5s 循环，状态全在存储里，重载不丢） ============
-const COUNTDOWN_MS = 120000;   // 固定 2 分钟
+// ============ 9. 开局 / 结束轮询（0.5s 循环，状态全在存储里，重载不丢） ============
 const POLL_START_MS = 24 * 60 * 1000;  // 第 24 分钟才开始轮询
 const POLL_INTERVAL_MS = 30000;
 
-function beginCountdown(ctx, msg, match, competition) {
-  const gid = gidOf(msg);
-  const sides = buildSides(match);
-  const ats = sides.attacker.qqs.concat(sides.defender.qqs).map(function (q) {
-    return '[CQ:at,qq=' + q + ']';
-  }).join(' ');
-  const text = ats +
-    '\n【三角占领】第 ' + match.round_id + ' 轮（对局ID ' + match.id + '）：掠夺者「' + sides.attacker.name + '」 vs 守护者「' + sides.defender.name + '」' +
-    '\n2 分钟后开局，请双方做好准备！';
-  seal.replyToSender(ctx, msg, text);
-  saveCountdown({
-    group: gid,
-    competitionId: competition.id,
-    competitionName: competition.name,
-    matchId: match.id,
-    roundId: match.round_id,
-    endAt: Date.now() + COUNTDOWN_MS,
-    reminded60: false,
-    lastNumber: -1,
-    attacker: sides.attacker,
-    defender: sides.defender,
-    players: sides.players,
-    ts: Date.now()
-  });
-}
-
-function tickCountdown() {
-  const cd = loadCountdown();
-  if (!cd) return;
-  const now = Date.now();
-  const remain = cd.endAt - now;
-  if (remain <= 0) {
-    clearCountdown();
-    startMatchFromCountdown(cd);
-    return;
-  }
-  if (remain <= 60000 && !cd.reminded60) {
-    cd.reminded60 = true;
-    saveCountdown(cd);
-    sendToGroup(cd.group, '距离开局还有 1 分钟！');
-    return;
-  }
-  if (remain <= 3000) {
-    const n = Math.ceil(remain / 1000); // 3 → 2 → 1
-    if (n >= 1 && n <= 3 && n !== cd.lastNumber) {
-      cd.lastNumber = n;
-      saveCountdown(cd);
-      sendToGroup(cd.group, String(n));
-    }
-  }
-}
-
-// 倒计时结束才开局：POST /api/init 拿秘钥，存对局身份，发棋盘截图
-async function startMatchFromCountdown(cd) {
+// .ts start <对局ID> 直接开局：POST /api/init 拿秘钥，存对局身份，发棋盘截图
+async function startMatchCore(info, ctx, msg) {
   const base = getCfg('controllerUrl').replace(/\/+$/, '');
+  const say = function (text) {
+    if (ctx && msg) seal.replyToSender(ctx, msg, text);
+    else sendToGroup(info.group, text);
+  };
   if (!base) {
-    sendToGroup(cd.group, '开局失败：未配置 controllerUrl（插件设置）');
+    say('开局失败：未配置 controllerUrl（插件设置）');
     return;
   }
-  sendToGroup(cd.group, '倒计时结束，正在开局…');
   try {
     const resp = await withTimeout(fetch(base + '/api/init', {
       method: 'POST',
@@ -537,33 +483,33 @@ async function startMatchFromCountdown(cd) {
     }
     if (resp.status >= 400 || !body || !body.ok) {
       const message = body && body.message ? body.message : 'HTTP ' + resp.status;
-      sendToGroup(cd.group, '开局失败：' + message + '（若提示请先导入歌曲库，需由后端运行人先 POST /api/songs；可重新 .ts start）');
+      say('开局失败：' + message + '（若提示请先导入歌曲库，需由后端运行人先 POST /api/songs；可重新 .ts start）');
       return;
     }
     const t = body.tokens || {};
     if (!t.match || !t.defender || !t.attacker) {
-      sendToGroup(cd.group, '开局成功但响应缺少 tokens，请确认控制器已包含成绩上传协议（/api/v1）');
+      say('开局成功但响应缺少 tokens，请确认控制器已包含成绩上传协议（/api/v1）');
       return;
     }
     ext.storageSet(K_MATCH, String(t.match));
     ext.storageSet(K_DEF, String(t.defender));
     ext.storageSet(K_ATK, String(t.attacker));
     saveMatchState({
-      group: cd.group,
-      competitionId: cd.competitionId,
-      competitionName: cd.competitionName,
-      matchId: cd.matchId,
-      roundId: cd.roundId,
+      group: info.group,
+      competitionId: info.competitionId,
+      competitionName: info.competitionName,
+      matchId: info.matchId,
+      roundId: info.roundId,
       startedAt: Date.now(),
       lastPollAt: 0,
-      attacker: cd.attacker,
-      defender: cd.defender,
-      players: cd.players
+      attacker: info.attacker,
+      defender: info.defender,
+      players: info.players
     });
-    sendToGroup(cd.group, '比赛已开始（第 ' + cd.roundId + ' 轮），秘钥已记录（不对外展示）。现在可以引用结算截图发送「上传成绩」。');
-    await sendScreenshotToGroup(cd.group, base, '控制器截图失败，请检查 screenshotUrl 与 web-read 后端');
+    say('比赛已开始（第 ' + info.roundId + ' 轮），秘钥已记录（不对外展示）。现在可以引用结算截图发送「上传成绩」。');
+    await sendScreenshotToGroup(info.group, base, '控制器截图失败，请检查 screenshotUrl 与 web-read 后端');
   } catch (e) {
-    sendToGroup(cd.group, '开局失败（网络/接口）：' + (e && e.message ? e.message : e) + '（可重新 .ts start）');
+    say('开局失败（网络/接口）：' + (e && e.message ? e.message : e) + '（可重新 .ts start）');
   }
 }
 
@@ -603,7 +549,6 @@ function tickCleanup() {
 }
 
 function tickLoop() {
-  try { tickCountdown(); } catch (e) { console.log('[' + ext.name + '] 倒计时循环错误：' + (e && e.message ? e.message : e)); }
   try { tickPoll(); } catch (e) { console.log('[' + ext.name + '] 轮询循环错误：' + (e && e.message ? e.message : e)); }
   try { tickCleanup(); } catch (e) { console.log('[' + ext.name + '] 清理循环错误：' + (e && e.message ? e.message : e)); }
 }
@@ -967,7 +912,7 @@ const cmd = seal.ext.newCmdItemInfo();
 cmd.name = 'ts';
 cmd.help = [
   '.ts help                    查看帮助',
-  '.ts status                  查看配置 / 倒计时 / 当前对局状态',
+  '.ts status                  查看配置 / 当前对局状态',
   '.ts start [对局ID]          拉取赛程 → 展示候选；带 ID 直接选择开局（仅群管理以上）',
   '.ts stop                    结束比赛并展示接下来的比赛（仅群管理以上）',
   '.ts board                   查看控制器当前比分/占领情况',
@@ -977,8 +922,7 @@ cmd.help = [
   '【开局流程】',
   '1. 群管理发送 .ts start，bot 列出候选对局（含双方与 QQ）；',
   '2. 群管理发送 .ts start <对局ID> 选择要开始的比赛（例：.ts start 13）；',
-  '3. bot @ 全体选手并开始 2 分钟倒计时（剩余 1 分钟时提醒一次，最后 3 秒读秒）；',
-  '4. 倒计时结束自动开局并记录秘钥，发棋盘截图。',
+  '3. bot @ 全体选手并直接开局（POST /api/init 自动记录秘钥，不对外展示），发棋盘截图。',
   '',
   '【上传成绩流程】',
   '1. 引用（回复）一张结算截图，消息文本填「上传成绩」；',
@@ -991,7 +935,7 @@ cmd.help = [
   '',
   '说明：.ts start / .ts stop 需要群管理以上权限；审核确认同样仅限群管理。',
   '',
-  '限制：同一时刻只支持一个群跑一局（倒计时 / 对局 / 秘钥为全局单实例）。'
+  '限制：同一时刻只支持一个群跑一局（对局 / 秘钥为全局单实例）。'
 ].join('\n');
 cmd.allowDelegate = false;
 cmd.disabledInPrivate = false;
@@ -1007,7 +951,6 @@ cmd.solve = function (ctx, msg, cmdArgs) {
 
   if (sub === 'status') {
     const gid = gidOf(msg);
-    const cd = loadCountdown();
     const st = loadMatchState();
     const pendings = loadPending();
     const pendingCount = Object.keys(pendings).filter(function (k) {
@@ -1021,13 +964,10 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       'ob11 依赖：' + (getNet() ? '可用' : '缺失'),
       '待审核成绩：' + pendingCount + ' 条'
     ];
-    if (cd && String(cd.group) === gid) {
-      const remain = Math.max(0, Math.ceil((cd.endAt - Date.now()) / 1000));
-      lines.unshift('倒计时：第 ' + cd.roundId + ' 轮对局，剩余 ' + remain + ' 秒');
-    } else if (st && String(st.group) === gid) {
+    if (st && String(st.group) === gid) {
       lines.unshift('当前对局：第 ' + st.roundId + ' 轮（掠夺者「' + st.attacker.name + '」 vs 守护者「' + st.defender.name + '」）已进行 ' + Math.floor((Date.now() - st.startedAt) / 60000) + ' 分钟');
     } else {
-      lines.unshift('当前状态：本群无倒计时/对局（发送 .ts start 开始）');
+      lines.unshift('当前状态：本群无进行中对局（发送 .ts start 开始）');
     }
     seal.replyToSender(ctx, msg, lines.join('\n'));
     return ret;
@@ -1039,15 +979,6 @@ cmd.solve = function (ctx, msg, cmdArgs) {
       return ret;
     }
     const gid = gidOf(msg);
-    const cd = loadCountdown();
-    if (cd) {
-      if (String(cd.group) === gid) {
-        seal.replyToSender(ctx, msg, '本群已有倒计时进行中（剩余 ' + Math.max(0, Math.ceil((cd.endAt - Date.now()) / 1000)) + ' 秒），请稍候');
-      } else {
-        seal.replyToSender(ctx, msg, '另一个群已有倒计时进行中（当前版本同一时刻只支持一个群跑一局），请稍候');
-      }
-      return ret;
-    }
     const st = loadMatchState();
     if (st) {
       if (String(st.group) === gid) {
@@ -1082,7 +1013,23 @@ cmd.solve = function (ctx, msg, cmdArgs) {
           seal.replyToSender(ctx, msg, '没有找到对局 ID=' + startId + ' 的待开始对局（可重新 .ts start 查看最新赛程）：\n' + lines.join('\n'));
           return;
         }
-        beginCountdown(ctx, msg, match, s.competition);
+        const sides = buildSides(match);
+        const ats = sides.attacker.qqs.concat(sides.defender.qqs).map(function (q) {
+          return '[CQ:at,qq=' + q + ']';
+        }).join(' ');
+        seal.replyToSender(ctx, msg, ats +
+          '\n【三角占领】第 ' + match.round_id + ' 轮（对局ID ' + match.id + '）：掠夺者「' + sides.attacker.name + '」 vs 守护者「' + sides.defender.name + '」' +
+          '\n正在开局…');
+        startMatchCore({
+          group: gid,
+          competitionId: s.competition.id,
+          competitionName: s.competition.name,
+          matchId: match.id,
+          roundId: match.round_id,
+          attacker: sides.attacker,
+          defender: sides.defender,
+          players: sides.players
+        }, ctx, msg);
         return;
       }
       seal.replyToSender(ctx, msg, '请群管理发送 .ts start <对局ID> 开始该场比赛（例：.ts start ' + candidates[0].id + '）：\n' + lines.join('\n'));
@@ -1183,13 +1130,7 @@ ext.cmdMap['三角'] = cmd;
 
 // ============ 13. 事件钩子 ============
 ext.onLoad = function () {
-  const cd = loadCountdown();
-  if (cd) {
-    const remain = Math.max(0, Math.ceil((cd.endAt - Date.now()) / 1000));
-    console.log('[' + ext.name + '] v' + ext.version + ' 已加载，恢复倒计时任务：第 ' + cd.roundId + ' 轮，剩余 ' + remain + ' 秒');
-  } else {
-    console.log('[' + ext.name + '] v' + ext.version + ' 已加载');
-  }
+  console.log('[' + ext.name + '] v' + ext.version + ' 已加载');
 };
 
 // 引用截图 + 触发文本（[CQ:reply] 前缀的消息不视为指令，走非指令钩子）。
@@ -1212,12 +1153,12 @@ ext.onNotCommandReceived = function (ctx, msg) {
   }
 };
 
-// 0.5s 常驻循环：倒计时 / 结束轮询 / 清理。状态全部在存储里，插件重载后继续跑；
+// 0.5s 常驻循环：结束轮询 / 清理。状态全部在存储里，插件重载后继续跑；
 // 用全局标记防止热重载重复启动循环。
-if (!globalThis.__tsCountdownLoopStarted) {
-  globalThis.__tsCountdownLoopStarted = true;
+if (!globalThis.__tsLoopStarted) {
+  globalThis.__tsLoopStarted = true;
   setInterval(tickLoop, 500);
-  console.log('[' + ext.name + '] 0.5s 常驻循环已启动（倒计时/轮询/清理）');
+  console.log('[' + ext.name + '] 0.5s 常驻循环已启动（轮询/清理）');
 }
 
 // mock-test.js 专用测试钩子（仅在测试环境暴露内部函数，不影响海豹运行）
