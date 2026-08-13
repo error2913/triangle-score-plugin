@@ -1,14 +1,13 @@
 // ==UserScript==
 // @name         triangle-score-plugin
 // @author       错误
-// @version      2.1.0
-// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 控制器状态走 WebSocket 推送（自动重连）
-// @timestamp    2026-08-12
+// @version      2.2.0
+// @description  对接「三角占领 · 赛时控制器」成绩上传协议：从比赛网站拉赛程 → 管理选对局 → 自动随机选边 → @选手开局 → 引用结算截图 → image-recognizer 识别 → 人工审核 → 上传成绩 → 截图反馈 → 控制器状态走 WebSocket 推送（自动重连）
+// @timestamp    2026-08-13
 // @license      MIT
 // @homepageURL  https://github.com/error2913/triangle-score-plugin
 // @updateUrl    https://raw.githubusercontent.com/error2913/triangle-score-plugin/main/triangle-score-plugin.js
 // @depends      错误:image-recognizer:>=1.0.0
-// @sealVersion  1.5.1
 // ==/UserScript==
 
 // 依赖说明：image-recognizer（cy2 特化版）提供 globalThis.imageRecognizerCy2API.recognize(url)，
@@ -18,7 +17,7 @@
 // ============ 1. 创建 / 复用扩展 ============
 let ext = seal.ext.find('triangle_score_plugin');
 if (!ext) {
-  ext = seal.ext.new('triangle_score_plugin', '错误', '2.1.0');
+  ext = seal.ext.new('triangle_score_plugin', '错误', '2.2.0');
   seal.ext.register(ext);
 }
 
@@ -27,6 +26,7 @@ seal.ext.registerStringConfig(ext, 'controllerUrl', 'http://127.0.0.1:8001', '�
 seal.ext.registerStringConfig(ext, 'screenshotUrl', 'http://127.0.0.1:46799', '网页截图后端地址（aiplugin4-backends web-read）');
 seal.ext.registerStringConfig(ext, 'screenshotToken', '', '网页截图后端访问令牌（aiplugin4-backends 配置了 token 时填写，请求头 X-Token）');
 seal.ext.registerStringConfig(ext, 'siteUrl', 'http://127.0.0.1:8000', '比赛网站地址（拉取赛程）');
+seal.ext.registerStringConfig(ext, 'siteToken', '', '比赛网站机器人令牌（对应后端 BOT_API_TOKEN），.ts start 开局前自动随机选边');
 seal.ext.registerStringConfig(ext, 'competitionId', '', '比赛 ID（留空自动使用当前进行中的比赛）');
 seal.ext.registerTemplateConfig(ext, 'triggerText', ['上传成绩'], '触发文本模板：每行一个正则，作用于去掉引用前缀后的消息文本，任一命中即触发');
 seal.ext.registerStringConfig(ext, 'debugLog', '1', '调试日志开关：1 打印截图/WS/接口详情到海豹日志，0 关闭');
@@ -442,6 +442,33 @@ async function fetchSchedule() {
     throw new Error(message);
   }
   return body;
+}
+
+// 开局前自动随机选边：调用后端机器人接口（X-Bot-Token 鉴权）。
+// 返回 { skipped }（未配置 siteToken）或 { skipped:false, swapped }。
+async function randomizeSides(matchId) {
+  const site = siteBase();
+  const token = String(getCfg('siteToken') || '').trim();
+  if (!site) throw new Error('未配置 siteUrl（插件设置）');
+  if (!token) return { skipped: true };
+  const url = site + '/api/bot/matches/' + encodeURIComponent(String(matchId)) + '/randomize-sides';
+  debugLog('自动随机选边：POST ' + url);
+  const resp = await withTimeout(fetch(url, {
+    method: 'POST',
+    headers: { 'X-Bot-Token': token }
+  }), 15000);
+  let body = null;
+  try {
+    body = await resp.json();
+  } catch (e) {
+    body = null;
+  }
+  debugLog('随机选边响应：HTTP ' + resp.status + ' 响应体=' + (body ? JSON.stringify(body).slice(0, 200) : '无'));
+  if (resp.status >= 400 || !body || body.ok !== true) {
+    const message = body && body.detail ? body.detail : 'HTTP ' + resp.status;
+    throw new Error(message);
+  }
+  return { skipped: false, swapped: body.swapped === true };
 }
 
 function sideText(p) {
@@ -1093,7 +1120,8 @@ cmd.help = [
   '【开局流程】',
   '1. 群管理发送 .ts start，bot 列出候选对局（含双方与 QQ）；',
   '2. 群管理发送 .ts start <对局ID> 选择要开始的比赛（例：.ts start 13）；',
-  '3. bot @ 已填 QQ 的选手并直接开局（POST /api/init 自动记录秘钥，不对外展示），发棋盘截图；',
+  '3. bot 自动随机选边（需后端 BOT_API_TOKEN + 插件 siteToken；未配置时跳过）后，',
+  '   @ 已填 QQ 的选手并直接开局（POST /api/init 自动记录秘钥，不对外展示），发棋盘截图；',
   '   未填 QQ 的一侧会收到警告，仍可强制开局，但该侧结算截图无法自动匹配身份上传。',
   '',
   '【上传成绩流程】',
@@ -1192,7 +1220,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
     }
     const startId = String(cmdArgs.getArgN(2) || '').trim();
     seal.replyToSender(ctx, msg, '正在拉取赛程…');
-    fetchSchedule().then(function (s) {
+    fetchSchedule().then(async function (s) {
       const candidates = (s.matches || []).filter(function (m) {
         return m.status === 'pending' && m.participant_a && m.participant_b;
       });
@@ -1205,12 +1233,36 @@ cmd.solve = function (ctx, msg, cmdArgs) {
         return '对局ID ' + m.id + ' ｜ 第' + m.round_id + '轮：掠夺者 ' + sideText(m.participant_a) + ' vs 守护者 ' + sideText(m.participant_b);
       });
       if (startId) {
-        const match = candidates.find(function (c) {
+        let match = candidates.find(function (c) {
           return String(c.id) === startId;
         });
         if (!match) {
           seal.replyToSender(ctx, msg, '没有找到对局 ID=' + startId + ' 的待开始对局（可重新 .ts start 查看最新赛程）：\n' + lines.join('\n'));
           return;
+        }
+        // 自动随机选边：先调后端机器人接口，再重新拉赛程拿交换后的阵营（含 QQ）。
+        const rand = await randomizeSides(match.id);
+        if (rand.skipped) {
+          debugLog('未配置 siteToken，跳过自动随机选边');
+          seal.replyToSender(ctx, msg, '（未配置 siteToken，跳过自动随机选边；如需自动选边，请在后端设置 BOT_API_TOKEN 并在插件填写 siteToken）');
+        } else {
+          try {
+            const fresh = await fetchSchedule();
+            const refreshed = (fresh.matches || []).find(function (c) {
+              return String(c.id) === String(match.id);
+            });
+            if (!refreshed) {
+              throw new Error('随机选边后未在赛程中找到该对局（ID=' + match.id + '）');
+            }
+            match = refreshed;
+            debugLog('随机选边完成：swapped=' + rand.swapped +
+              '（掠夺者「' + (match.participant_a && match.participant_a.name) +
+              '」 vs 守护者「' + (match.participant_b && match.participant_b.name) + '」）');
+          } catch (e) {
+            debugLog('自动随机选边失败：' + (e && e.message ? e.message : e));
+            seal.replyToSender(ctx, msg, '自动随机选边失败：' + (e && e.message ? e.message : e) + '，未开局');
+            return;
+          }
         }
         const sides = buildSides(match);
         const missingQq = [];
@@ -1225,7 +1277,7 @@ cmd.solve = function (ctx, msg, cmdArgs) {
         }).join(' ');
         seal.replyToSender(ctx, msg, (ats ? ats + '\n' : '') +
           '【三角占领】第 ' + match.round_id + ' 轮（对局ID ' + match.id + '）：掠夺者「' + sides.attacker.name + '」 vs 守护者「' + sides.defender.name + '」' +
-          '\n正在开局…');
+          (rand.skipped ? '' : '\n（已自动随机选边）') + '\n正在开局…');
         startMatchCore({
           group: gid,
           competitionId: s.competition.id,
